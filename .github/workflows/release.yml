@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v2.1.1-shield1)'
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: 'gradle'
+
+      - name: Set up ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ccache-${{ runner.os }}-release
+          restore-keys: |
+            ccache-${{ runner.os }}-release
+            ccache-${{ runner.os }}-
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build Release
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --parallel assembleRelease --stacktrace
+
+      - name: Locate release zip
+        id: locate
+        run: |
+          RELEASE_ZIP=$(find out -name "*Release*.zip" | head -1)
+          if [ -z "$RELEASE_ZIP" ]; then
+            echo "ERROR: No release zip found in out/"
+            ls -la out/ || true
+            exit 1
+          fi
+          echo "zip=$RELEASE_ZIP" >> $GITHUB_OUTPUT
+          echo "name=$(basename "$RELEASE_ZIP")" >> $GITHUB_OUTPUT
+          echo "Found: $RELEASE_ZIP"
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ShieldAttestation ${{ steps.tag.outputs.tag }}
+          body: |
+            ## ShieldAttestation ${{ steps.tag.outputs.tag }}
+
+            Fork of [TrickyStore OSS](https://github.com/beakthoven/TrickyStoreOSS) with config path
+            changed to `/data/adb/shieldsdk/integrity/attest` for ShieldSDK integration.
+
+            **Changes vs upstream:**
+            - `CONFIG_PATH` → `/data/adb/shieldsdk/integrity/attest`
+            - `--nice-name` → `ShieldAttestation`
+          files: ${{ steps.locate.outputs.zip }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -61,7 +61,7 @@ object PkgConfig {
         Logger.e("failed to update keybox", it)
     }
 
-    private const val CONFIG_PATH = "/data/adb/tricky_store"
+    private const val CONFIG_PATH = "/data/adb/shieldsdk/integrity/attest"
     private const val TARGET_FILE = "target.txt"
     private const val KEYBOX_FILE = "keybox.xml"
     private const val TEE_STATUS_FILE = "tee_status"
