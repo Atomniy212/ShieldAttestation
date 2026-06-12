@@ -17,6 +17,8 @@ import android.system.keystore2.KeyEntryResponse
 import android.system.keystore2.KeyMetadata
 import androidx.annotation.Keep
 import io.github.beakthoven.TrickyStoreOSS.CertificateGen
+import io.github.beakthoven.TrickyStoreOSS.CertificateHack
+import io.github.beakthoven.TrickyStoreOSS.CertificateUtils
 import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.interceptors.InterceptorUtils.getTransactCode
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
@@ -32,6 +34,8 @@ class SecurityLevelInterceptor(
     companion object {
         private val generateKeyTransaction =
             getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
+        private val importKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importKey")
         private val deleteKeyTransaction =
             getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "deleteKey")
         private val createOperationTransaction =
@@ -60,7 +64,7 @@ class SecurityLevelInterceptor(
     }
 
     data class Key(val uid: Int, val alias: String)
-    data class Info(val keyPair: KeyPair, val response: KeyEntryResponse)
+    data class Info(val keyPair: KeyPair?, val response: KeyEntryResponse)
 
     override fun onPreTransact(
         target: IBinder,
@@ -70,6 +74,20 @@ class SecurityLevelInterceptor(
         callingPid: Int,
         data: Parcel
     ): Result {
+        // Fix: invalidate cache when a key is imported over an existing alias
+        if (code == importKeyTransaction) {
+            kotlin.runCatching {
+                data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
+                val k = Key(callingUid, keyDescriptor.alias)
+                keys.remove(k)
+                keyPairs.remove(k)
+                skipLeafHacks.remove(k)
+                Logger.i("importKey: cleared attestation cache uid=$callingUid alias=${keyDescriptor.alias}")
+            }.onFailure { Logger.e("importKey cache clear failed", it) }
+            return Skip
+        }
+
         if (code == generateKeyTransaction) {
             Logger.i("intercept key gen uid=$callingUid pid=$callingPid")
             kotlin.runCatching {
@@ -115,6 +133,84 @@ class SecurityLevelInterceptor(
             }
         }
         return Skip
+    }
+
+    /**
+     * Post-transact hook for generateKey:
+     * For needHack apps generating a signing key with an attestation challenge
+     * (but NOT a PURPOSE_ATTEST_KEY and NOT using an explicit attestation key),
+     * the real TEE key is generated normally. We intercept the reply, hack the
+     * certificate chain, and cache the result so that getKeyEntry returns the
+     * same (consistent) keybox chain — eliminating the leaf mismatch detected
+     * by tools like Duck Detector.
+     */
+    override fun onPostTransact(
+        target: IBinder,
+        code: Int,
+        flags: Int,
+        callingUid: Int,
+        callingPid: Int,
+        data: Parcel,
+        reply: Parcel?,
+        resultCode: Int
+    ): Result {
+        if (code != generateKeyTransaction) return Skip
+        if (reply == null) return Skip
+        if (!PkgConfig.needHack(callingUid)) return Skip
+
+        return kotlin.runCatching {
+            // Re-parse request to inspect key parameters
+            data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+            val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                ?: return@runCatching Skip
+            val attestationKeyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+            val params = data.createTypedArray(KeyParameter.CREATOR) ?: return@runCatching Skip
+            val kgp = CertificateGen.KeyGenParameters(params)
+
+            // Only handle plain signing keys with attestation challenge;
+            // PURPOSE_ATTEST_KEY and explicit attestation keys are already handled in onPreTransact.
+            if (kgp.purpose.contains(7) || attestationKeyDescriptor != null) return@runCatching Skip
+            if (kgp.attestationChallenge == null) return@runCatching Skip
+
+            // Skip if reply has an exception
+            if (kotlin.runCatching { reply.readException() }.isFailure) return@runCatching Skip
+
+            // Read the real TEE-issued KeyMetadata from the reply
+            val realMetadata = reply.readTypedObject(KeyMetadata.CREATOR)
+                ?: return@runCatching Skip
+
+            // Build the real cert chain from metadata fields
+            val leafCert = CertificateUtils.run { realMetadata.certificate?.toCertificate() }
+                ?: return@runCatching Skip
+            val additionalCerts = CertificateUtils.run {
+                realMetadata.certificateChain.toCertificates()
+            }
+            val chain = (listOf(leafCert) + additionalCerts).toTypedArray<Certificate>()
+
+            // Hack: replace cert chain with keybox cert
+            val hackedChain = CertificateHack.hackCertificateChain(chain)
+
+            // Apply hacked chain back into metadata (mutates realMetadata)
+            realMetadata.putCertificateChain(hackedChain).getOrThrow()
+
+            // Cache as KeyEntryResponse so getKeyEntry returns the same chain
+            val response = KeyEntryResponse()
+            response.metadata = realMetadata
+            response.iSecurityLevel = original
+            val key = Key(callingUid, keyDescriptor.alias)
+            keys[key] = Info(null, response)
+            skipLeafHacks[key] = true
+            Logger.i("onPostTransact: hacked generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
+
+            // Return hacked metadata as the binder reply
+            val p = Parcel.obtain()
+            p.writeNoException()
+            p.writeTypedObject(realMetadata, 0)
+            OverrideReply(0, p)
+        }.getOrElse { t ->
+            Logger.e("onPostTransact generateKey hack failed uid=$callingUid", t)
+            Skip
+        }
     }
 
     private fun buildResponse(

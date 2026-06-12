@@ -66,6 +66,13 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         }
     }
 
+    /**
+     * Android isolated processes use UIDs in the range [appBase + 90000, appBase + 99999].
+     * They never request attestation through us, and processing them can destabilise the
+     * Keystore service connection used by the grant-domain probes (Duck Detector detection #4).
+     */
+    private fun isIsolatedUid(uid: Int): Boolean = (uid % 100000) >= 90000
+
     override fun onPreTransact(
         target: IBinder,
         code: Int,
@@ -74,6 +81,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         callingPid: Int,
         data: Parcel
     ): Result {
+        if (isIsolatedUid(callingUid)) return Skip
         if (code == getKeyEntryTransaction) {
             if (KeyBoxUtils.hasKeyboxes()) {
                 Logger.d("intercept pre  $target uid=$callingUid pid=$callingPid dataSz=${data.dataSize()}")
@@ -129,6 +137,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         reply: Parcel?,
         resultCode: Int
     ): Result {
+        if (isIsolatedUid(callingUid)) return Skip
         if (target != keystore || reply == null) return Skip
         if (reply.hasException()) return Skip
         val p = Parcel.obtain()
