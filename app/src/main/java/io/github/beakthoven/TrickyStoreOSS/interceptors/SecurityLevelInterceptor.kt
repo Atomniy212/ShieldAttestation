@@ -159,7 +159,9 @@ class SecurityLevelInterceptor(
         if (!PkgConfig.needHack(callingUid)) return Skip
 
         return kotlin.runCatching {
-            // Re-parse request to inspect key parameters
+            // Re-parse request from the beginning — onPreTransact may have already advanced
+            // the read position, so we must reset it before re-reading the parameters.
+            data.setDataPosition(0)
             data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
                 ?: return@runCatching Skip
@@ -173,6 +175,7 @@ class SecurityLevelInterceptor(
             if (kgp.attestationChallenge == null) return@runCatching Skip
 
             // Skip if reply has an exception
+            reply.setDataPosition(0)
             if (kotlin.runCatching { reply.readException() }.isFailure) return@runCatching Skip
 
             // Read the real TEE-issued KeyMetadata from the reply
