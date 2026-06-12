@@ -137,7 +137,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         reply: Parcel?,
         resultCode: Int
     ): Result {
-        if (isIsolatedUid(callingUid)) return Skip
+        // Note: do NOT skip isolated UIDs here — GMS uses an isolated process for Play Integrity
+        // attestation and its getKeyEntry responses must still be hacked with the keybox cert.
+        // Isolated-UID skip in onPreTransact (cache lookups) is sufficient to prevent crashes.
         if (target != keystore || reply == null) return Skip
         if (reply.hasException()) return Skip
         val p = Parcel.obtain()
