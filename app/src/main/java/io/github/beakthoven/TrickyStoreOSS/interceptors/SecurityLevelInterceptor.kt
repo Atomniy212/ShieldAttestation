@@ -125,8 +125,20 @@ class SecurityLevelInterceptor(
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
                 } else if (PkgConfig.needHack(callingUid)) {
-                    if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null)) {
-                        Logger.i("Generating key in generation mode for attestation: uid=$callingUid alias=${keyDescriptor.alias}")
+                    // Intercept ANY key generated with attestation (PURPOSE_ATTEST_KEY, explicit
+                    // attestation-key descriptor, or an attestation challenge).  Using OverrideReply
+                    // here prevents the real key from ever being stored in keystore2, which has two
+                    // critical benefits:
+                    //   1. getKeyEntry (via onPreTransact cache) returns the IDENTICAL cert as
+                    //      generateKey → Patch-mode / Binder-chain probes see no leaf mismatch.
+                    //   2. grant() for the alias fails in real keystore2 (key not found) →
+                    //      getKeyEntry(GRANT) returns KEY_NOT_FOUND → Duck Detector's Grant
+                    //      self-domain probe reports UNAVAILABLE instead of SELF_CHAIN_SPLIT.
+                    val isAttestationKey = kgp.purpose.contains(7)
+                            || attestationKeyDescriptor != null
+                            || kgp.attestationChallenge != null
+                    if (isAttestationKey) {
+                        Logger.i("Attestation key intercept (OverrideReply): uid=$callingUid alias=${keyDescriptor.alias}")
                         val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
                             ?: return@runCatching
                         keyPairs[Key(callingUid, keyDescriptor.alias)] = Pair(pair.first, pair.second)
@@ -138,8 +150,10 @@ class SecurityLevelInterceptor(
                         p.writeTypedObject(response.metadata, 0)
                         return OverrideReply(0, p)
                     } else {
+                        // Non-attestation key (pure SIGN/ENCRYPT without challenge):
+                        // let real hardware generate it; no cert hacking needed.
                         skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
-                        Logger.i("Cleared skip flag for non-attestation key: uid=$callingUid alias=${keyDescriptor.alias}")
+                        Logger.i("Non-attestation key, skipping intercept: uid=$callingUid alias=${keyDescriptor.alias}")
                         return Skip
                     }
                 }
@@ -151,24 +165,17 @@ class SecurityLevelInterceptor(
     }
 
     /**
-     * Post-transact hook for generateKey — aligns generateKey reply with getKeyEntry for
-     * target apps (needHack/needGenerate) that use the old-style API (SIGN + attestation
-     * challenge, no explicit attestation key).
+     * Post-transact hook for generateKey.
      *
-     * NOTE: hackCertificateChain is non-deterministic (fresh timestamp/signature each call).
-     * Hacking generateKey here AND hacking getKeyEntry in Keystore2Interceptor.onPostTransact
-     * would produce two DIFFERENT certs even if both paths are "hacked" — the very mismatch
-     * Duck Detector detects.
+     * After the onPreTransact change (v2.1.12-shield1), ALL attestation generateKey calls for
+     * target apps (needHack/needGenerate) return OverrideReply, so this hook is no longer
+     * reachable for any target-app attestation path.  It is kept as a safety net for edge
+     * cases (e.g., a target app that somehow bypasses onPreTransact) and for non-target apps
+     * where it correctly returns Skip.
      *
-     * The actual fix is symmetric exclusion:
-     *   • Non-target apps → Skip here AND Skip in Keystore2Interceptor.onPostTransact for
-     *     getKeyEntry → both return real TEE cert → consistent → no detection.
-     *   • Target apps → onPreTransact handles ATTEST_KEY/attestationKeyDescriptor via cache
-     *     (skipLeafHacks), so onPostTransact for generateKey is only reached for SIGN+challenge
-     *     keys without explicit ATTEST_KEY — a rare code path that keeps cert hacking scoped.
-     *
-     * keys/keyPairs/skipLeafHacks are NOT touched so the real TEE key remains in Keystore
-     * for signing, grant, and update operations.
+     * The cert cache (hackedCertCache) is populated here if somehow reached so that any
+     * subsequent Keystore2Interceptor.onPostTransact getKeyEntry call can return the same
+     * cert bytes rather than calling hackCertificateChain again.
      */
     override fun onPostTransact(
         target: IBinder,
