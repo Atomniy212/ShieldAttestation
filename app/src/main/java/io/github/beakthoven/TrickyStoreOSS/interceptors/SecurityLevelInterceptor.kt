@@ -24,6 +24,7 @@ import io.github.beakthoven.TrickyStoreOSS.interceptors.InterceptorUtils.getTran
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
 import io.github.beakthoven.TrickyStoreOSS.putCertificateChain
 import java.security.KeyPair
+import java.security.MessageDigest
 import java.security.cert.Certificate
 import java.util.concurrent.ConcurrentHashMap
 
@@ -87,6 +88,63 @@ class SecurityLevelInterceptor(
          */
         @Keep
         val keyIdToOwner = ConcurrentHashMap<Long, Key>()
+
+        /**
+         * Deterministic cert cache keyed by the SHA-256 of the REAL TEE leaf certificate.
+         *
+         * This is the backbone of cross-path consistency. A key's real hardware certificate
+         * is byte-for-byte identical no matter HOW it is read (APP alias, KEY_ID, GRANT, the
+         * public/hidden Java KeyStore, or a raw private binder), because the certificate is a
+         * property of the key, not of the descriptor used to fetch it. By caching the hacked
+         * output under the hash of the real input leaf, every read of the same underlying key
+         * returns the IDENTICAL hacked bytes — even Duck Detector's Grant self-domain "Hidden"
+         * stage that bypasses KeyStoreManager and reads the GRANT namespace through a separate
+         * binder surface. No grant-id / key-id tracking is required for consistency; the real
+         * cert is the natural identity. hackCertificateChain is non-deterministic, so without
+         * this the same key hacked twice produces two different DER leaves → CHAIN_SPLIT.
+         */
+        @Keep
+        val hackedByRealLeaf = ConcurrentHashMap<String, Pair<ByteArray, ByteArray?>>()
+
+        /** SHA-256 hex of a DER blob, used as the [hackedByRealLeaf] key. */
+        @Keep
+        fun leafHashKey(der: ByteArray?): String? {
+            if (der == null || der.isEmpty()) return null
+            return runCatching {
+                MessageDigest.getInstance("SHA-256").digest(der)
+                    .joinToString(separator = "") { b -> "%02x".format(b) }
+            }.getOrNull()
+        }
+
+        /**
+         * True if the key's metadata reports an IMPORTED / SECURELY_IMPORTED origin.
+         *
+         * Imported keys carry a marker leaf the caller set explicitly (e.g. Duck Detector's
+         * ImportKey-retained-narrative probe imports the keybox fixture cert). They are never
+         * hardware-attested and Play Integrity only uses GENERATED keys, so we MUST return the
+         * real imported cert untouched — neither hacking it (which would change the marker) nor
+         * serving a stale hacked chain cached under the same alias from a prior generateKey.
+         */
+        @Keep
+        fun isImportedOrigin(metadata: KeyMetadata?): Boolean {
+            val auths = metadata?.authorizations ?: return false
+            for (a in auths) {
+                val kp = a?.keyParameter ?: continue
+                if (kp.tag == Tag.ORIGIN) {
+                    val v = kp.value ?: return false
+                    val origin = runCatching { v.origin }.getOrNull()
+                        ?: runCatching { v.integer }.getOrNull()
+                        ?: return false
+                    // android.hardware.security.keymint.KeyOrigin: IMPORTED=2, SECURELY_IMPORTED=4
+                    return origin == ORIGIN_IMPORTED || origin == ORIGIN_SECURELY_IMPORTED
+                }
+            }
+            return false
+        }
+
+        // android.hardware.security.keymint.KeyOrigin values.
+        private const val ORIGIN_IMPORTED = 2
+        private const val ORIGIN_SECURELY_IMPORTED = 4
 
         // android.system.keystore2.Domain values.
         const val DOMAIN_APP = 0
@@ -369,6 +427,10 @@ class SecurityLevelInterceptor(
             val realMetadata = reply.readTypedObject(KeyMetadata.CREATOR)
                 ?: return@runCatching Skip
 
+            // Capture the REAL leaf hash BEFORE hacking — this is the cross-path identity that
+            // getKeyEntry (alias/KEY_ID/GRANT) will use to serve these exact hacked bytes.
+            val realLeafHash = leafHashKey(realMetadata.certificate)
+
             // Build cert chain from TEE metadata fields.
             val leafCert = CertificateUtils.run { realMetadata.certificate?.toCertificate() }
                 ?: return@runCatching Skip
@@ -378,6 +440,15 @@ class SecurityLevelInterceptor(
             // Replace with keybox cert chain.
             val hackedChain = CertificateHack.hackCertificateChain(chain)
             realMetadata.putCertificateChain(hackedChain).getOrThrow()
+
+            // Deterministic cache: any later read of this key (whatever the descriptor/path)
+            // resolves the same real leaf hash and gets these identical hacked bytes.
+            if (realLeafHash != null) {
+                hackedByRealLeaf[realLeafHash] = Pair(
+                    realMetadata.certificate ?: ByteArray(0),
+                    realMetadata.certificateChain
+                )
+            }
 
             // Cache the resulting cert bytes keyed by uid+alias.  Keystore2Interceptor
             // will look this up for getKeyEntry and return the SAME bytes, making

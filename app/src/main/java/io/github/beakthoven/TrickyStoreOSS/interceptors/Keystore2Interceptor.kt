@@ -322,7 +322,40 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 }
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)
                 if (response != null) {
-                    // Cache-hit: return byte-for-byte identical cert produced earlier.
+                    // Imported keys (e.g. the keybox-fixture marker the ImportKey-narrative probe
+                    // sets) must be returned untouched: never hack the marker leaf, never serve a
+                    // stale hacked chain cached under the same alias from a prior generateKey.
+                    if (SecurityLevelInterceptor.isImportedOrigin(response.metadata)) {
+                        Logger.i("getKeyEntry: imported-origin key, passthrough uid=$callingUid key=$cacheKey")
+                        p.recycle()
+                        return Skip
+                    }
+
+                    // PRIMARY consistency: resolve the hacked bytes by the REAL leaf hash. The
+                    // real cert is identical across every read path, so this returns byte-for-byte
+                    // identical bytes for owner/grant/KEY_ID reads alike — including the Grant
+                    // self-domain "Hidden" stage that bypasses the alias/grant-id caches.
+                    val realLeafHash =
+                        SecurityLevelInterceptor.leafHashKey(response.metadata?.certificate)
+                    val hashCached = realLeafHash?.let { SecurityLevelInterceptor.hackedByRealLeaf[it] }
+                    if (hashCached != null) {
+                        response.metadata?.let { meta ->
+                            meta.certificate = hashCached.first
+                            meta.certificateChain = hashCached.second
+                        }
+                        // Keep the alias/grant caches warm for the isolated-grant pre mirror.
+                        if (cacheKey != null) {
+                            SecurityLevelInterceptor.cacheHackedCert(
+                                cacheKey.uid, cacheKey.alias, hashCached.first, hashCached.second
+                            )
+                            SecurityLevelInterceptor.hackedResponseCache[cacheKey] = response
+                            SecurityLevelInterceptor.rememberKeyId(response.metadata?.key, cacheKey)
+                        }
+                        Logger.i("getKeyEntry: real-leaf cache hit uid=$callingUid key=$cacheKey grant=$isGrant")
+                        return createTypedObjectReply(response)
+                    }
+
+                    // Legacy alias/grant cache-hit (synthetic/mirrored paths).
                     val cached = cacheKey?.let { SecurityLevelInterceptor.hackedCertCache[it] }
                     if (cached != null) {
                         response.metadata?.let { meta ->
@@ -343,6 +376,16 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                             return Skip
                         }
                         response.putCertificateChain(newChain).getOrThrow()
+                        // Deterministic cache keyed by the real leaf hash so EVERY later read of
+                        // this key (any descriptor / any binder surface) returns these bytes.
+                        if (realLeafHash != null) {
+                            response.metadata?.let { meta ->
+                                SecurityLevelInterceptor.hackedByRealLeaf[realLeafHash] = Pair(
+                                    meta.certificate ?: ByteArray(0),
+                                    meta.certificateChain
+                                )
+                            }
+                        }
                         // Cache under the resolved owner key so all later reads stay identical.
                         if (cacheKey != null) {
                             response.metadata?.let { meta ->
