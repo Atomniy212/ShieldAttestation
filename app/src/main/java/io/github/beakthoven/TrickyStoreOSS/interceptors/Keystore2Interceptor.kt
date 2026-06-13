@@ -115,29 +115,18 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return Skip
 
-                // GRANT-domain read: mirror the owner's exact hacked response so the grantee
-                // (even an isolated process that cannot reach keystore2) gets byte-for-byte
-                // identical bytes → no CHAIN_SPLIT, no injected exception (timing probe clean).
+                // GRANT-domain read: do NOT pre-mirror. Let native keystore2 enforce the grant's
+                // access vector (GET_INFO, USE, etc.) and grantee binding itself, then leaf-hack
+                // the returned chain in onPostTransact via the real-leaf hash cache so the grantee
+                // still gets bytes identical to the owner (consistent self/isolated-domain chains).
+                //
+                // Pre-mirroring bypassed the GET_INFO permission check — a grantee with accessVector
+                // lacking GET_INFO could still read metadata, which stock keystore2 forbids. That is
+                // the GET_KEY_ENTRY_WITHOUT_GET_INFO_ALLOWED anomaly Duck Detector flags, and exactly
+                // the behaviour official TrickyStore avoids by never intercepting grant reads.
                 if (descriptor.domain == DOMAIN_GRANT) {
-                    val info = grantedCertKeys[descriptor.nspace]
-                    if (info != null) {
-                        // Only the actual grantee may read the grant handle. Mirroring to a
-                        // non-grantee (owner replay) is the abnormal NON_GRANTEE_READBACK_ALLOWED
-                        // behaviour Duck Detector flags — let keystore2 reject it instead.
-                        if (callingUid != info.granteeUid) {
-                            Logger.i("GRANT nspace=${descriptor.nspace} read by non-grantee uid=$callingUid (grantee=${info.granteeUid}); not mirrored")
-                            return Skip
-                        }
-                        val cachedResp = SecurityLevelInterceptor.hackedResponseCache[info.owner]
-                        if (cachedResp != null) {
-                            Logger.i("Mirroring GRANT nspace=${descriptor.nspace} -> owner=${info.owner} uid=$callingUid (isolated=${isIsolatedUid(callingUid)})")
-                            return createTypedObjectReply(cachedResp)
-                        }
-                        // No full response cached: let it through and fix the cert in post.
-                        Logger.i("GRANT nspace=${descriptor.nspace} owner=${info.owner} but no cached response; Continue for post mirror")
-                        return Continue
-                    }
-                    // Unknown grant id: not one of ours, behave normally.
+                    Logger.i("GRANT read uid=$callingUid nspace=${descriptor.nspace}; Continue (native perms + post leaf-hack)")
+                    return Continue
                 }
 
                 // Standard isolated-UID gate: isolated processes must not hit the alias cache
