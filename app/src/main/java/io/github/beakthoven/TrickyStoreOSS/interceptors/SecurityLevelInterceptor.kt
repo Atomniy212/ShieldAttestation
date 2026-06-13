@@ -50,6 +50,19 @@ class SecurityLevelInterceptor(
         @Keep
         val skipLeafHacks = ConcurrentHashMap<Key, Boolean>()
 
+        /**
+         * Cert cache populated by [onPostTransact] when generateKey is hacked.
+         * Stores (leafCertDer, chainBlobBytes) keyed by uid+alias so that the
+         * corresponding getKeyEntry call in Keystore2Interceptor returns the
+         * IDENTICAL cert bytes.  hackCertificateChain is non-deterministic —
+         * it produces a fresh signature on every call — so calling it from
+         * generateKey and then again from getKeyEntry yields two certs with the
+         * same serial but different DER bytes, which is exactly what Duck
+         * Detector's Patch-mode / Binder-chain probes detect as a mismatch.
+         */
+        @Keep
+        val hackedCertCache = ConcurrentHashMap<Key, Pair<ByteArray, ByteArray?>>()
+
         @Keep
         fun getKeyResponse(uid: Int, alias: String): KeyEntryResponse? =
             keys[Key(uid, alias)]?.response
@@ -84,6 +97,7 @@ class SecurityLevelInterceptor(
                 keys.remove(k)
                 keyPairs.remove(k)
                 skipLeafHacks.remove(k)
+                hackedCertCache.remove(k)
                 Logger.i("importKey: cleared attestation cache uid=$callingUid alias=${keyDescriptor.alias}")
             }.onFailure { Logger.e("importKey cache clear failed", it) }
             return Skip
@@ -198,11 +212,20 @@ class SecurityLevelInterceptor(
             val additionalCerts = CertificateUtils.run { realMetadata.certificateChain.toCertificates() }
             val chain = (listOf(leafCert) + additionalCerts).toTypedArray<Certificate>()
 
-            // Replace with keybox cert chain (same deterministic output as Keystore2Interceptor).
+            // Replace with keybox cert chain.
             val hackedChain = CertificateHack.hackCertificateChain(chain)
             realMetadata.putCertificateChain(hackedChain).getOrThrow()
 
-            Logger.i("onPostTransact: hacked generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
+            // Cache the resulting cert bytes keyed by uid+alias.  Keystore2Interceptor
+            // will look this up for getKeyEntry and return the SAME bytes, making
+            // generateKey and getKeyEntry byte-for-byte identical so Duck Detector's
+            // Patch-mode and Binder-chain probes no longer detect a leaf mismatch.
+            hackedCertCache[Key(callingUid, keyDescriptor.alias)] = Pair(
+                realMetadata.certificate ?: ByteArray(0),
+                realMetadata.certificateChain
+            )
+
+            Logger.i("onPostTransact: hacked+cached generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
 
             // Return modified metadata — real key stays in TEE for all further operations.
             val p = Parcel.obtain()

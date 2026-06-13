@@ -153,7 +153,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
             if (keyDescriptor == null || keyDescriptor.domain == 0) return Skip
 
-            SecurityLevelInterceptor.keys.remove(SecurityLevelInterceptor.Key(callingUid, keyDescriptor.alias))
+            val cacheKey = SecurityLevelInterceptor.Key(callingUid, keyDescriptor.alias)
+            SecurityLevelInterceptor.keys.remove(cacheKey)
+            SecurityLevelInterceptor.hackedCertCache.remove(cacheKey)
 
             return Skip
         } else if (code == getKeyEntryTransaction) {
@@ -163,18 +165,34 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             //     isolated process whose UID is NOT in PkgConfig; it still needs the keybox cert
             //     from getKeyEntry so Play Integrity returns STRONG, not BASIC.
             //
-            // Non-target, non-isolated apps (e.g. Duck Detector) get the real TEE cert here.
-            // SecurityLevelInterceptor.onPostTransact also skips them for generateKey, so both
-            // paths return the real cert → consistent → Patch-mode / Binder-chain detections pass.
-            // hackCertificateChain is non-deterministic (fresh timestamp each call); hacking both
-            // paths for the same alias would produce two different certs — still a mismatch.
+            // For target apps in AUTO mode (e.g. Duck Detector) the primary path is the cert
+            // cache: SecurityLevelInterceptor.onPostTransact hacked generateKey and stored the
+            // cert; we return that SAME cert here so Duck Detector's Patch-mode / Binder-chain
+            // probes see generateKey == getKeyEntry (hackCertificateChain is non-deterministic —
+            // a fresh call produces different DER bytes even for the same key, causing the mismatch).
             if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid) && !isIsolatedUid(callingUid)) return Skip
             try {
                 data.enforceInterface("android.system.keystore2.IKeystoreService")
+                val reqDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                val alias = reqDescriptor?.alias
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)
                 if (response != null) {
+                    // Cache-hit path: return the cert that was produced by generateKey so both
+                    // calls return byte-for-byte identical DER → Duck Detector sees no leaf mismatch.
+                    val cached = if (alias != null)
+                        SecurityLevelInterceptor.hackedCertCache[SecurityLevelInterceptor.Key(callingUid, alias)]
+                    else null
+                    if (cached != null) {
+                        response.metadata?.let { meta ->
+                            meta.certificate = cached.first
+                            meta.certificateChain = cached.second
+                        }
+                        Logger.i("getKeyEntry: cert cache hit uid=$callingUid alias=$alias")
+                        return createTypedObjectReply(response)
+                    }
+                    // Cache-miss path (isolated GMS processes, first call before generateKey, etc.)
                     val chain = CertificateUtils.run { response.getCertificateChain() }
-                if (chain != null) {
+                    if (chain != null) {
                         val newChain = CertificateHack.hackCertificateChain(chain)
                         response.putCertificateChain(newChain).getOrThrow()
                         Logger.i("Hacked certificate for uid=$callingUid")
