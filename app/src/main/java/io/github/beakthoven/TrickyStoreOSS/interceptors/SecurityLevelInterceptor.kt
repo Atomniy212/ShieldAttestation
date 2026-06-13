@@ -63,6 +63,24 @@ class SecurityLevelInterceptor(
         @Keep
         val hackedCertCache = ConcurrentHashMap<Key, Pair<ByteArray, ByteArray?>>()
 
+        /**
+         * Set of all aliases for which a needHack app called generateKey (regardless of
+         * whether attestation was involved or the cert cache was populated).
+         *
+         * Used by Keystore2Interceptor.onPostTransact to decide the getKeyEntry policy:
+         *  - If alias is in hackedCertCache → return the EXACT same cert that generateKey returned.
+         *  - If alias is in generatedAliases but NOT in hackedCertCache → return Skip so the
+         *    caller gets the REAL cert from keystore2, which is byte-for-byte identical to what
+         *    generateKey returned (both paths hit the real TEE → same cert → Patch mode passes).
+         *  - If alias is in neither set → fresh hackCertificateChain (isolated GMS path, etc.).
+         *
+         * Also used for grant tracking: any alias in this set that is subsequently granted
+         * gets its nspace added to Keystore2Interceptor.blockedGrantIds to prevent the
+         * grant-based getKeyEntry from calling hackCertificateChain with a different timestamp.
+         */
+        @Keep
+        val generatedAliases = ConcurrentHashMap.newKeySet<Key>()
+
         @Keep
         fun getKeyResponse(uid: Int, alias: String): KeyEntryResponse? =
             keys[Key(uid, alias)]?.response
@@ -98,6 +116,7 @@ class SecurityLevelInterceptor(
                 keyPairs.remove(k)
                 skipLeafHacks.remove(k)
                 hackedCertCache.remove(k)
+                generatedAliases.remove(k)
                 Logger.i("importKey: cleared attestation cache uid=$callingUid alias=${keyDescriptor.alias}")
             }.onFailure { Logger.e("importKey cache clear failed", it) }
             return Skip
@@ -125,6 +144,13 @@ class SecurityLevelInterceptor(
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
                 } else if (PkgConfig.needHack(callingUid)) {
+                    // Track ALL generateKey calls for this needHack UID regardless of type.
+                    // Keystore2Interceptor uses this to decide the getKeyEntry cert policy:
+                    // if the alias is known but NOT in hackedCertCache, return the real TEE cert
+                    // unchanged (same cert that generateKey returned) instead of calling
+                    // hackCertificateChain again with a different timestamp → Patch mode passes.
+                    generatedAliases.add(Key(callingUid, keyDescriptor.alias))
+
                     // Intercept keys that need a keybox attestation certificate.
                     //
                     // PURPOSE_ATTEST_KEY (7) and explicit attestationKeyDescriptor use OverrideReply:
@@ -150,8 +176,11 @@ class SecurityLevelInterceptor(
                         p.writeTypedObject(response.metadata, 0)
                         return OverrideReply(0, p)
                     } else {
-                        // Non-attestation key (pure SIGN/ENCRYPT without challenge):
-                        // let real hardware generate it; no cert hacking needed.
+                        // Non-attestation key (pure SIGN/ENCRYPT): let real hardware generate it.
+                        // Cert hacking for these keys happens in onPostTransact if the TEE also
+                        // provided an attestation cert (attestationChallenge != null path).
+                        // Alias is already in generatedAliases above so getKeyEntry will not call
+                        // hackCertificateChain fresh (which would produce a mismatching cert).
                         skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
                         Logger.i("Non-attestation key, skipping intercept: uid=$callingUid alias=${keyDescriptor.alias}")
                         return Skip
