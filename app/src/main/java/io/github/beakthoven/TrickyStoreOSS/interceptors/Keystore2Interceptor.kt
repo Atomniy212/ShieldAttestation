@@ -178,25 +178,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             }
         }
 
-        // grant(): must Continue so onPostTransact fires and records grantId -> owner.
-        // Skip would forward to keystore2 with NO post callback, so the mapping (and thus
-        // grant mirroring) would never happen — this is why grants kept splitting.
-        if (code == grantTransaction && KeyBoxUtils.hasKeyboxes()) {
-            if (PkgConfig.needHack(callingUid) || PkgConfig.needGenerate(callingUid)) {
-                Logger.i("grant() uid=$callingUid; Continue to record grant mapping in post")
-                return Continue
-            }
-            return Skip
-        }
-
-        // updateSubcomponent(): the cert-update probe (Update-persistence) replaces a key's
-        // leaf with a new marker. Match official TrickyStore — let the real update reach
-        // hardware and INVALIDATE our cached hacked chain so the next read returns the fresh
-        // marker (no stale TEE response), then fall through to Skip (forward to keystore2).
-        if (code == updateSubcomponentTransaction && updateSubcomponentTransaction != -1 &&
-            KeyBoxUtils.hasKeyboxes()) {
-            handleUpdateSubcomponentPre(callingUid, data)
-        }
+        // grant() / updateSubcomponent(): NOT intercepted. Official TrickyStore only hooks
+        // getKeyEntry; touching grant/updateSubcomponent added non-stock behaviour that real
+        // anti-tamper SDKs can detect. We let both flow straight to native keystore2.
 
         // For all other transaction codes, skip isolated UIDs entirely.
         if (isIsolatedUid(callingUid)) return Skip
@@ -255,35 +239,6 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
             SecurityLevelInterceptor.clearAliasState(callingUid, keyDescriptor.alias)
 
-            return Skip
-        } else if (code == grantTransaction) {
-            // Record the grant id → owner mapping only for aliases we actually leaf-hacked
-            // (cert/response cached). Pure native keys are not tracked, so their grants pass
-            // through untouched and stay consistent by construction.
-            if (PkgConfig.needHack(callingUid) || PkgConfig.needGenerate(callingUid)) {
-                try {
-                    data.enforceInterface("android.system.keystore2.IKeystoreService")
-                    val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                    // grant(in KeyDescriptor key, in int granteeUid, in int accessVector):
-                    // read the grantee UID so we can bind the mirror to that caller only.
-                    val granteeUid = data.readInt()
-                    // The granted key descriptor may be APP-domain (alias) or KEY_ID-domain.
-                    val ownerKey = resolveOwnerKey(callingUid, keyDescriptor)
-                    if (ownerKey != null) {
-                        val hacked = SecurityLevelInterceptor.hackedCertCache.containsKey(ownerKey) ||
-                                SecurityLevelInterceptor.hackedResponseCache.containsKey(ownerKey)
-                        if (hacked) {
-                            val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR)
-                            if (grantDescriptor?.domain == DOMAIN_GRANT) {
-                                grantedCertKeys[grantDescriptor.nspace] = GrantInfo(ownerKey, granteeUid)
-                                Logger.i("Tracked GRANT nspace=${grantDescriptor.nspace} -> owner=$ownerKey grantee=$granteeUid uid=$callingUid")
-                            }
-                        }
-                    }
-                } catch (e: Exception) {
-                    Logger.e("grantTransaction onPostTransact failed uid=$callingUid", e)
-                }
-            }
             return Skip
         } else if (code == getKeyEntryTransaction) {
             // Uniform keybox substitution — NO app is on a deny list. Every app (incl. Duck
