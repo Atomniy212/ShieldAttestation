@@ -49,7 +49,16 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
      * identical bytes, so Grant self-domain / isolated-domain probes see aligned chains.
      * This matches official TrickyStore, which keeps grants consistent rather than failing.
      */
-    private val grantedCertKeys = ConcurrentHashMap<Long, SecurityLevelInterceptor.Key>()
+    private val grantedCertKeys = ConcurrentHashMap<Long, GrantInfo>()
+
+    /**
+     * Per-grant binding: the owner whose hacked cert we mirror, plus the grantee UID the
+     * grant was issued to. Stock keystore2 binds a grant handle to its grantee — only that
+     * UID may read it. We therefore mirror ONLY when callingUid == granteeUid; a non-grantee
+     * read (e.g. the owner replaying an isolated grant handle) must fall through to keystore2's
+     * KEY_NOT_FOUND, otherwise Duck Detector flags NON_GRANTEE_READBACK_ALLOWED (caller binding).
+     */
+    private data class GrantInfo(val owner: SecurityLevelInterceptor.Key, val granteeUid: Int)
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -110,15 +119,22 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 // (even an isolated process that cannot reach keystore2) gets byte-for-byte
                 // identical bytes → no CHAIN_SPLIT, no injected exception (timing probe clean).
                 if (descriptor.domain == DOMAIN_GRANT) {
-                    val ownerKey = grantedCertKeys[descriptor.nspace]
-                    if (ownerKey != null) {
-                        val cachedResp = SecurityLevelInterceptor.hackedResponseCache[ownerKey]
+                    val info = grantedCertKeys[descriptor.nspace]
+                    if (info != null) {
+                        // Only the actual grantee may read the grant handle. Mirroring to a
+                        // non-grantee (owner replay) is the abnormal NON_GRANTEE_READBACK_ALLOWED
+                        // behaviour Duck Detector flags — let keystore2 reject it instead.
+                        if (callingUid != info.granteeUid) {
+                            Logger.i("GRANT nspace=${descriptor.nspace} read by non-grantee uid=$callingUid (grantee=${info.granteeUid}); not mirrored")
+                            return Skip
+                        }
+                        val cachedResp = SecurityLevelInterceptor.hackedResponseCache[info.owner]
                         if (cachedResp != null) {
-                            Logger.i("Mirroring GRANT nspace=${descriptor.nspace} -> owner=$ownerKey uid=$callingUid (isolated=${isIsolatedUid(callingUid)})")
+                            Logger.i("Mirroring GRANT nspace=${descriptor.nspace} -> owner=${info.owner} uid=$callingUid (isolated=${isIsolatedUid(callingUid)})")
                             return createTypedObjectReply(cachedResp)
                         }
                         // No full response cached: let it through and fix the cert in post.
-                        Logger.i("GRANT nspace=${descriptor.nspace} owner=$ownerKey but no cached response; Continue for post mirror")
+                        Logger.i("GRANT nspace=${descriptor.nspace} owner=${info.owner} but no cached response; Continue for post mirror")
                         return Continue
                     }
                     // Unknown grant id: not one of ours, behave normally.
@@ -184,12 +200,13 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             return Skip
         }
 
-        // updateSubcomponent(): the cert-update probe (Update-persistence) sets a new marker
-        // leaf. Update our cache in-memory and return success WITHOUT reaching hardware so the
-        // next read returns the marker, not the stale cached chain.
+        // updateSubcomponent(): the cert-update probe (Update-persistence) replaces a key's
+        // leaf with a new marker. Match official TrickyStore — let the real update reach
+        // hardware and INVALIDATE our cached hacked chain so the next read returns the fresh
+        // marker (no stale TEE response), then fall through to Skip (forward to keystore2).
         if (code == updateSubcomponentTransaction && updateSubcomponentTransaction != -1 &&
             KeyBoxUtils.hasKeyboxes()) {
-            handleUpdateSubcomponentPre(callingUid, data)?.let { return it }
+            handleUpdateSubcomponentPre(callingUid, data)
         }
 
         // For all other transaction codes, skip isolated UIDs entirely.
@@ -212,31 +229,17 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         }
     }
 
-    private fun handleUpdateSubcomponentPre(callingUid: Int, data: Parcel): Result? {
-        return try {
+    private fun handleUpdateSubcomponentPre(callingUid: Int, data: Parcel) {
+        try {
             data.enforceInterface(IKeystoreService.DESCRIPTOR)
             val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-            val ownerKey = resolveOwnerKey(callingUid, descriptor) ?: return null
-            val cachedResp = SecurityLevelInterceptor.hackedResponseCache[ownerKey] ?: return null
-            val publicCert = data.createByteArray()
-            val certChain = data.createByteArray()
-            cachedResp.metadata?.let { meta ->
-                meta.certificate = publicCert
-                meta.certificateChain = certChain
-            }
-            SecurityLevelInterceptor.cacheHackedCert(
-                ownerKey.uid,
-                ownerKey.alias,
-                publicCert ?: ByteArray(0),
-                certChain
-            )
-            Logger.i("updateSubcomponent: updated cached cert for owner=$ownerKey uid=$callingUid")
-            val p = Parcel.obtain()
-            p.writeNoException()
-            OverrideReply(0, p)
+            // The cert-update path arrives as a KEY_ID (alias=null) descriptor; resolve the
+            // owner so we can drop the now-stale cached chain for that key.
+            val ownerKey = resolveOwnerKey(callingUid, descriptor) ?: return
+            SecurityLevelInterceptor.clearAliasState(ownerKey.uid, ownerKey.alias)
+            Logger.i("updateSubcomponent: invalidated cache for owner=$ownerKey uid=$callingUid (passthrough to hardware)")
         } catch (e: Exception) {
             Logger.e("handleUpdateSubcomponentPre failed uid=$callingUid", e)
-            null
         }
     }
 
@@ -272,6 +275,9 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 try {
                     data.enforceInterface("android.system.keystore2.IKeystoreService")
                     val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                    // grant(in KeyDescriptor key, in int granteeUid, in int accessVector):
+                    // read the grantee UID so we can bind the mirror to that caller only.
+                    val granteeUid = data.readInt()
                     // The granted key descriptor may be APP-domain (alias) or KEY_ID-domain.
                     val ownerKey = resolveOwnerKey(callingUid, keyDescriptor)
                     if (ownerKey != null) {
@@ -280,8 +286,8 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                         if (hacked) {
                             val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR)
                             if (grantDescriptor?.domain == DOMAIN_GRANT) {
-                                grantedCertKeys[grantDescriptor.nspace] = ownerKey
-                                Logger.i("Tracked GRANT nspace=${grantDescriptor.nspace} -> owner=$ownerKey uid=$callingUid")
+                                grantedCertKeys[grantDescriptor.nspace] = GrantInfo(ownerKey, granteeUid)
+                                Logger.i("Tracked GRANT nspace=${grantDescriptor.nspace} -> owner=$ownerKey grantee=$granteeUid uid=$callingUid")
                             }
                         }
                     }
@@ -306,7 +312,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 // Resolve the cache key: GRANT reads map via grant id, KEY_ID reads via keyId,
                 // otherwise uid+alias. This keeps every descriptor form pointing at one cert.
                 val cacheKey: SecurityLevelInterceptor.Key? = when {
-                    isGrant -> reqDescriptor?.let { grantedCertKeys[it.nspace] }
+                    isGrant -> reqDescriptor?.let { grantedCertKeys[it.nspace]?.owner }
                     reqDescriptor?.domain == DOMAIN_KEY_ID ->
                         reqDescriptor.let { SecurityLevelInterceptor.keyIdToOwner[it.nspace] }
                     reqDescriptor?.alias != null ->
