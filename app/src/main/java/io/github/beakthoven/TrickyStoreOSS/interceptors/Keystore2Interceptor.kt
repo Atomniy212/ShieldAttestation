@@ -70,8 +70,11 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
      * Isolated processes (uid % 100000 >= 90000) must not hit the alias cache lookup in
      * onPreTransact — the cache key is indexed by uid+alias and isolated UIDs are ephemeral,
      * so a cache miss would return a null KeyEntryResponse, crashing the caller.
-     * onPostTransact is NOT guarded so that GMS's isolated attestation process still gets its
-     * getKeyEntry reply hacked with the keybox cert chain → STRONG integrity preserved.
+     *
+     * onPostTransact is also guarded by the PkgConfig check (see below). GMS's attestation
+     * flow uses entirely fake keys created by onPreTransact OverrideReply; those keys do not
+     * exist in real Keystore so any isolated getKeyEntry call returns an exception reply which
+     * is caught by reply.hasException() before the PkgConfig check is reached.
      */
     private fun isIsolatedUid(uid: Int): Boolean = (uid % 100000) >= 90000
 
@@ -154,6 +157,13 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
             return Skip
         } else if (code == getKeyEntryTransaction) {
+            // Only spoof certs for target apps (needHack/needGenerate).
+            // Non-target apps get the real TEE cert from both getKeyEntry (this skip) and
+            // generateKey (SecurityLevelInterceptor also skips non-target) → both paths return
+            // the real cert → no mismatch → Patch-mode / Binder-chain detections resolved.
+            // hackCertificateChain is non-deterministic (fresh timestamp each call), so hacking
+            // both paths independently would still produce differing certs even if both "hacked".
+            if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid)) return Skip
             try {
                 data.enforceInterface("android.system.keystore2.IKeystoreService")
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)

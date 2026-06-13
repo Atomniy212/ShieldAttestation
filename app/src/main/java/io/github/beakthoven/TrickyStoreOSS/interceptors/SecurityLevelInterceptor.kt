@@ -137,20 +137,24 @@ class SecurityLevelInterceptor(
     }
 
     /**
-     * Post-transact hook for generateKey — aligns generateKey reply with getKeyEntry.
+     * Post-transact hook for generateKey — aligns generateKey reply with getKeyEntry for
+     * target apps (needHack/needGenerate) that use the old-style API (SIGN + attestation
+     * challenge, no explicit attestation key).
      *
-     * Keystore2Interceptor.onPostTransact hacks getKeyEntry for ALL callers (no PkgConfig filter).
-     * Without a matching hook here, generateKey returns the real TEE cert while getKeyEntry
-     * returns the keybox cert → Patch mode / Binder chain detections.
+     * NOTE: hackCertificateChain is non-deterministic (fresh timestamp/signature each call).
+     * Hacking generateKey here AND hacking getKeyEntry in Keystore2Interceptor.onPostTransact
+     * would produce two DIFFERENT certs even if both paths are "hacked" — the very mismatch
+     * Duck Detector detects.
      *
-     * This hook mirrors the same policy: intercept any generateKey for a plain signing key
-     * with an attestation challenge (old-style API, no explicit attestation key), regardless
-     * of whether the caller is in the target list.  needGenerate/needHack apps that use
-     * PURPOSE_ATTEST_KEY or explicit attestationKeyDescriptor are handled in onPreTransact
-     * and never reach this path.
+     * The actual fix is symmetric exclusion:
+     *   • Non-target apps → Skip here AND Skip in Keystore2Interceptor.onPostTransact for
+     *     getKeyEntry → both return real TEE cert → consistent → no detection.
+     *   • Target apps → onPreTransact handles ATTEST_KEY/attestationKeyDescriptor via cache
+     *     (skipLeafHacks), so onPostTransact for generateKey is only reached for SIGN+challenge
+     *     keys without explicit ATTEST_KEY — a rare code path that keeps cert hacking scoped.
      *
-     * Critically, keys/keyPairs/skipLeafHacks are NOT touched so the real TEE key remains
-     * available for signing, grant, and update operations.
+     * keys/keyPairs/skipLeafHacks are NOT touched so the real TEE key remains in Keystore
+     * for signing, grant, and update operations.
      */
     override fun onPostTransact(
         target: IBinder,
@@ -163,8 +167,9 @@ class SecurityLevelInterceptor(
         resultCode: Int
     ): Result {
         if (code != generateKeyTransaction || reply == null) return Skip
-        // No PkgConfig filter here: mirrors Keystore2Interceptor.onPostTransact which hacks
-        // getKeyEntry for all callers.  Apps not in the target list still get consistent certs.
+        // Non-target apps: skip so generateKey returns the real TEE cert, consistent with
+        // getKeyEntry (also skipped in Keystore2Interceptor.onPostTransact for non-target).
+        if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid)) return Skip
 
         return kotlin.runCatching {
             // onPreTransact already consumed data; reset before re-reading the request.
