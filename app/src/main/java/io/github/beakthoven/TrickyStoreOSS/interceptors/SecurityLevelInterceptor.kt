@@ -17,6 +17,8 @@ import android.system.keystore2.KeyEntryResponse
 import android.system.keystore2.KeyMetadata
 import androidx.annotation.Keep
 import io.github.beakthoven.TrickyStoreOSS.CertificateGen
+import io.github.beakthoven.TrickyStoreOSS.CertificateHack
+import io.github.beakthoven.TrickyStoreOSS.CertificateUtils
 import io.github.beakthoven.TrickyStoreOSS.config.PkgConfig
 import io.github.beakthoven.TrickyStoreOSS.interceptors.InterceptorUtils.getTransactCode
 import io.github.beakthoven.TrickyStoreOSS.logging.Logger
@@ -109,15 +111,7 @@ class SecurityLevelInterceptor(
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
                 } else if (PkgConfig.needHack(callingUid)) {
-                    // Intercept any key generation that carries an attestation challenge:
-                    //   • PURPOSE_ATTEST_KEY (purpose=7) — primary attestation key
-                    //   • explicit attestationKeyDescriptor  — SIGN key attested via separate key
-                    //   • attestationChallenge != null       — SIGN key using old-style direct attestation
-                    //     (e.g. apps like Duck Detector). GMS uses explicit attestationKeyDescriptor on
-                    //     Android 12+, so it is not affected by the third condition.
-                    // All three paths generate a software-backed key via CertificateGen so that
-                    // generateKey and getKeyEntry return *identical* keybox cert chains.
-                    if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null) || (kgp.attestationChallenge != null)) {
+                    if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null)) {
                         Logger.i("Generating key in generation mode for attestation: uid=$callingUid alias=${keyDescriptor.alias}")
                         val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
                             ?: return@runCatching
@@ -140,6 +134,80 @@ class SecurityLevelInterceptor(
             }
         }
         return Skip
+    }
+
+    /**
+     * Post-transact hook for generateKey on needHack apps.
+     *
+     * When a needHack app generates a SIGN key with an attestation challenge but without an
+     * explicit attestation key (old-style API used by Duck Detector and similar), onPreTransact
+     * lets the real TEE create the key and returns Skip.  We then intercept the TEE reply here,
+     * replace the cert chain with the keybox chain, and return the modified KeyMetadata.
+     *
+     * Critically we do NOT touch keys/keyPairs/skipLeafHacks, so:
+     *  • The real key continues to exist in the TEE for signing, grant, and update operations.
+     *  • getKeyEntry falls through to Keystore2Interceptor.onPostTransact which also calls
+     *    hackCertificateChain → both generateKey and getKeyEntry return the same keybox cert.
+     *
+     * GMS is not affected: it uses explicit attestationKeyDescriptor (purpose=7 or non-null
+     * attestationKeyDescriptor) which are intercepted in onPreTransact, so this onPostTransact
+     * path is never reached for GMS.
+     */
+    override fun onPostTransact(
+        target: IBinder,
+        code: Int,
+        flags: Int,
+        callingUid: Int,
+        callingPid: Int,
+        data: Parcel,
+        reply: Parcel?,
+        resultCode: Int
+    ): Result {
+        if (code != generateKeyTransaction || reply == null) return Skip
+        if (!PkgConfig.needHack(callingUid)) return Skip
+
+        return kotlin.runCatching {
+            // onPreTransact already consumed data; reset before re-reading the request.
+            data.setDataPosition(0)
+            data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+            val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                ?: return@runCatching Skip
+            val attestationKeyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+            val params = data.createTypedArray(KeyParameter.CREATOR) ?: return@runCatching Skip
+            val kgp = CertificateGen.KeyGenParameters(params)
+
+            // Only handle plain signing keys with attestation challenge; all other cases
+            // are already intercepted in onPreTransact and never reach onPostTransact.
+            if (kgp.purpose.contains(7) || attestationKeyDescriptor != null) return@runCatching Skip
+            if (kgp.attestationChallenge == null) return@runCatching Skip
+
+            // Parse the real TEE reply.
+            reply.setDataPosition(0)
+            if (kotlin.runCatching { reply.readException() }.isFailure) return@runCatching Skip
+            val realMetadata = reply.readTypedObject(KeyMetadata.CREATOR)
+                ?: return@runCatching Skip
+
+            // Build cert chain from TEE metadata fields.
+            val leafCert = CertificateUtils.run { realMetadata.certificate?.toCertificate() }
+                ?: return@runCatching Skip
+            val additionalCerts = CertificateUtils.run { realMetadata.certificateChain.toCertificates() }
+            val chain = (listOf(leafCert) + additionalCerts).toTypedArray<Certificate>()
+
+            // Replace with keybox cert chain (same deterministic output as Keystore2Interceptor).
+            val hackedChain = CertificateHack.hackCertificateChain(chain)
+            realMetadata.putCertificateChain(hackedChain).getOrThrow()
+
+            Logger.i("onPostTransact: hacked generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
+
+            // Return modified metadata — real key stays in TEE for all further operations.
+            val p = Parcel.obtain()
+            p.writeNoException()
+            p.writeTypedObject(realMetadata, 0)
+            OverrideReply(0, p)
+        }.getOrElse { t ->
+            Logger.e("onPostTransact generateKey hack failed uid=$callingUid", t)
+            Skip
+        }
     }
 
     private fun buildResponse(
