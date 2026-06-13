@@ -77,6 +77,24 @@ class SecurityLevelInterceptor(
         val hackedResponseCache = ConcurrentHashMap<Key, KeyEntryResponse>()
 
         /**
+         * Maps a keystore2 KEY_ID (the numeric id keystore2 assigns to a loaded key and
+         * returns in metadata.key.nspace) back to the OWNER's (uid, alias).
+         *
+         * Duck Detector switches every follow-up read/grant to a KEY_ID-domain descriptor
+         * (domain=4) which carries NO alias, so an alias-keyed cache would miss and trigger
+         * a fresh non-deterministic hack → chain split. This map lets KEY_ID reads and
+         * KEY_ID-based grants resolve to the same cached cert as the original alias.
+         */
+        @Keep
+        val keyIdToOwner = ConcurrentHashMap<Long, Key>()
+
+        // android.system.keystore2.Domain values.
+        const val DOMAIN_APP = 0
+        const val DOMAIN_GRANT = 1
+        const val DOMAIN_SELINUX = 2
+        const val DOMAIN_KEY_ID = 4
+
+        /**
          * Legacy membership set kept only as a weak signal for diagnostics/backward
          * compatibility. It must never decide getKeyEntry passthrough by itself:
          * Play Integrity/GMS needs the keybox chain on every cache-miss path.
@@ -144,6 +162,15 @@ class SecurityLevelInterceptor(
             hackedResponseCache.remove(k)
             generatedAliases.remove(k)
             aliasStates.remove(k)
+            keyIdToOwner.entries.removeAll { it.value == k }
+        }
+
+        /** Record the KEY_ID -> owner mapping from a metadata.key descriptor, if present. */
+        @Keep
+        fun rememberKeyId(metadataKey: KeyDescriptor?, owner: Key) {
+            if (metadataKey != null && metadataKey.domain == DOMAIN_KEY_ID) {
+                keyIdToOwner[metadataKey.nspace] = owner
+            }
         }
 
         @Keep
@@ -202,6 +229,10 @@ class SecurityLevelInterceptor(
                 val aFlags = data.readInt()
                 val entropy = data.createByteArray()
                 val kgp = CertificateGen.KeyGenParameters(params)
+                // Regenerating over an existing alias must invalidate any stale cached cert,
+                // otherwise getKeyEntry would serve the previous key's chain (Update-persistence
+                // STALE_TEE_RESPONSE detection).
+                clearAliasState(callingUid, keyDescriptor.alias)
                 if (PkgConfig.needGenerate(callingUid)) {
                     aliasStates[Key(callingUid, keyDescriptor.alias)] = AliasState(
                         uid = callingUid,
@@ -365,6 +396,10 @@ class SecurityLevelInterceptor(
             grantResponse.metadata = realMetadata
             grantResponse.iSecurityLevel = original
             hackedResponseCache[Key(callingUid, keyDescriptor.alias)] = grantResponse
+
+            // Map the KEY_ID keystore2 assigned to this key back to the owner alias so that
+            // KEY_ID-domain reads/grants (which carry no alias) resolve to this same cert.
+            rememberKeyId(realMetadata.key, Key(callingUid, keyDescriptor.alias))
 
             Logger.i("onPostTransact: hacked+cached generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
 

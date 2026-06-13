@@ -31,6 +31,12 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         getTransactCode(IKeystoreService.Stub::class.java, "deleteKey")
     private val grantTransaction =
         getTransactCode(IKeystoreService.Stub::class.java, "grant")
+    private val updateSubcomponentTransaction =
+        kotlin.runCatching { getTransactCode(IKeystoreService.Stub::class.java, "updateSubcomponent") }
+            .getOrDefault(-1)
+
+    private val DOMAIN_GRANT = SecurityLevelInterceptor.DOMAIN_GRANT
+    private val DOMAIN_KEY_ID = SecurityLevelInterceptor.DOMAIN_KEY_ID
 
     /**
      * Maps a grant id (the nspace of a GRANT-domain KeyDescriptor returned by grant())
@@ -103,7 +109,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 // GRANT-domain read: mirror the owner's exact hacked response so the grantee
                 // (even an isolated process that cannot reach keystore2) gets byte-for-byte
                 // identical bytes → no CHAIN_SPLIT, no injected exception (timing probe clean).
-                if (descriptor.domain == 2 /* GRANT */) {
+                if (descriptor.domain == DOMAIN_GRANT) {
                     val ownerKey = grantedCertKeys[descriptor.nspace]
                     if (ownerKey != null) {
                         val cachedResp = SecurityLevelInterceptor.hackedResponseCache[ownerKey]
@@ -122,6 +128,14 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 // (cache is keyed by uid+alias; isolated UIDs are ephemeral, so a miss would
                 // return a null response and crash the caller).
                 if (isIsolatedUid(callingUid)) return Skip
+
+                // KEY_ID-domain read (Duck Detector's follow-up descriptor) carries no alias.
+                // Continue so onPostTransact resolves the owner via keyIdToOwner and serves the
+                // SAME cached cert as the alias/generate path (otherwise a fresh hack → split).
+                if (descriptor.domain == DOMAIN_KEY_ID && PkgConfig.needHack(callingUid)) {
+                    Logger.i("KEY_ID read uid=$callingUid nspace=${descriptor.nspace}; Continue for post resolve")
+                    return Continue
+                }
 
                 if (PkgConfig.needGenerate(callingUid)) {
                     val response = SecurityLevelInterceptor.getKeyResponse(callingUid, descriptor.alias)
@@ -159,10 +173,71 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             }
         }
 
+        // grant(): must Continue so onPostTransact fires and records grantId -> owner.
+        // Skip would forward to keystore2 with NO post callback, so the mapping (and thus
+        // grant mirroring) would never happen — this is why grants kept splitting.
+        if (code == grantTransaction && KeyBoxUtils.hasKeyboxes()) {
+            if (PkgConfig.needHack(callingUid) || PkgConfig.needGenerate(callingUid)) {
+                Logger.i("grant() uid=$callingUid; Continue to record grant mapping in post")
+                return Continue
+            }
+            return Skip
+        }
+
+        // updateSubcomponent(): the cert-update probe (Update-persistence) sets a new marker
+        // leaf. Update our cache in-memory and return success WITHOUT reaching hardware so the
+        // next read returns the marker, not the stale cached chain.
+        if (code == updateSubcomponentTransaction && updateSubcomponentTransaction != -1 &&
+            KeyBoxUtils.hasKeyboxes()) {
+            handleUpdateSubcomponentPre(callingUid, data)?.let { return it }
+        }
+
         // For all other transaction codes, skip isolated UIDs entirely.
         if (isIsolatedUid(callingUid)) return Skip
 
         return Skip
+    }
+
+    /**
+     * Resolve the owner (uid, alias) for a key descriptor that may be APP-domain (has alias)
+     * or KEY_ID-domain (no alias, resolved via keyIdToOwner).
+     */
+    private fun resolveOwnerKey(callingUid: Int, descriptor: KeyDescriptor?): SecurityLevelInterceptor.Key? {
+        if (descriptor == null) return null
+        val alias = descriptor.alias
+        return when {
+            descriptor.domain == DOMAIN_KEY_ID -> SecurityLevelInterceptor.keyIdToOwner[descriptor.nspace]
+            alias != null -> SecurityLevelInterceptor.Key(callingUid, alias)
+            else -> null
+        }
+    }
+
+    private fun handleUpdateSubcomponentPre(callingUid: Int, data: Parcel): Result? {
+        return try {
+            data.enforceInterface(IKeystoreService.DESCRIPTOR)
+            val descriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+            val ownerKey = resolveOwnerKey(callingUid, descriptor) ?: return null
+            val cachedResp = SecurityLevelInterceptor.hackedResponseCache[ownerKey] ?: return null
+            val publicCert = data.createByteArray()
+            val certChain = data.createByteArray()
+            cachedResp.metadata?.let { meta ->
+                meta.certificate = publicCert
+                meta.certificateChain = certChain
+            }
+            SecurityLevelInterceptor.cacheHackedCert(
+                ownerKey.uid,
+                ownerKey.alias,
+                publicCert ?: ByteArray(0),
+                certChain
+            )
+            Logger.i("updateSubcomponent: updated cached cert for owner=$ownerKey uid=$callingUid")
+            val p = Parcel.obtain()
+            p.writeNoException()
+            OverrideReply(0, p)
+        } catch (e: Exception) {
+            Logger.e("handleUpdateSubcomponentPre failed uid=$callingUid", e)
+            null
+        }
     }
 
     override fun onPostTransact(
@@ -197,14 +272,14 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 try {
                     data.enforceInterface("android.system.keystore2.IKeystoreService")
                     val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                    val alias = keyDescriptor?.alias
-                    if (alias != null) {
-                        val ownerKey = SecurityLevelInterceptor.Key(callingUid, alias)
+                    // The granted key descriptor may be APP-domain (alias) or KEY_ID-domain.
+                    val ownerKey = resolveOwnerKey(callingUid, keyDescriptor)
+                    if (ownerKey != null) {
                         val hacked = SecurityLevelInterceptor.hackedCertCache.containsKey(ownerKey) ||
                                 SecurityLevelInterceptor.hackedResponseCache.containsKey(ownerKey)
                         if (hacked) {
                             val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR)
-                            if (grantDescriptor?.domain == 2) {
+                            if (grantDescriptor?.domain == DOMAIN_GRANT) {
                                 grantedCertKeys[grantDescriptor.nspace] = ownerKey
                                 Logger.i("Tracked GRANT nspace=${grantDescriptor.nspace} -> owner=$ownerKey uid=$callingUid")
                             }
@@ -227,10 +302,13 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             try {
                 data.enforceInterface("android.system.keystore2.IKeystoreService")
                 val reqDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                val isGrant = reqDescriptor?.domain == 2 /* GRANT */
-                // Resolve the cache key: GRANT reads map back to the owner; otherwise uid+alias.
+                val isGrant = reqDescriptor?.domain == DOMAIN_GRANT
+                // Resolve the cache key: GRANT reads map via grant id, KEY_ID reads via keyId,
+                // otherwise uid+alias. This keeps every descriptor form pointing at one cert.
                 val cacheKey: SecurityLevelInterceptor.Key? = when {
                     isGrant -> reqDescriptor?.let { grantedCertKeys[it.nspace] }
+                    reqDescriptor?.domain == DOMAIN_KEY_ID ->
+                        reqDescriptor.let { SecurityLevelInterceptor.keyIdToOwner[it.nspace] }
                     reqDescriptor?.alias != null ->
                         SecurityLevelInterceptor.Key(callingUid, reqDescriptor.alias)
                     else -> null
@@ -275,6 +353,8 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                                     meta.certificateChain
                                 )
                                 SecurityLevelInterceptor.hackedResponseCache[cacheKey] = response
+                                // Map the KEY_ID to the owner so KEY_ID-domain reads stay aligned.
+                                SecurityLevelInterceptor.rememberKeyId(meta.key, cacheKey)
                             }
                         }
                         Logger.i("Hacked certificate for uid=$callingUid grant=$isGrant key=$cacheKey")
