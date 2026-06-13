@@ -64,6 +64,19 @@ class SecurityLevelInterceptor(
         val hackedCertCache = ConcurrentHashMap<Key, Pair<ByteArray, ByteArray?>>()
 
         /**
+         * Full hacked [KeyEntryResponse] keyed by the OWNER's uid+alias.
+         *
+         * Used to mirror grant reads: when a hacked key is granted to another UID,
+         * getKeyEntry(GRANT) returns this exact response so the grantee (even an
+         * isolated process that cannot talk to keystore2) gets a byte-for-byte
+         * identical chain. This is how official TrickyStore keeps Grant self-domain
+         * and Grant isolated-domain probes aligned (no CHAIN_SPLIT) without throwing
+         * an exception that would otherwise trip the timing side-channel probe.
+         */
+        @Keep
+        val hackedResponseCache = ConcurrentHashMap<Key, KeyEntryResponse>()
+
+        /**
          * Legacy membership set kept only as a weak signal for diagnostics/backward
          * compatibility. It must never decide getKeyEntry passthrough by itself:
          * Play Integrity/GMS needs the keybox chain on every cache-miss path.
@@ -128,6 +141,7 @@ class SecurityLevelInterceptor(
             keyPairs.remove(k)
             skipLeafHacks.remove(k)
             hackedCertCache.remove(k)
+            hackedResponseCache.remove(k)
             generatedAliases.remove(k)
             aliasStates.remove(k)
         }
@@ -204,6 +218,7 @@ class SecurityLevelInterceptor(
                     keyPairs[Key(callingUid, keyDescriptor.alias)] = Pair(pair.first, pair.second)
                     val response = buildResponse(pair.second, kgp, attestationKeyDescriptor ?: keyDescriptor)
                     keys[Key(callingUid, keyDescriptor.alias)] = Info(pair.first, response)
+                    hackedResponseCache[Key(callingUid, keyDescriptor.alias)] = response
                     val p = Parcel.obtain()
                     p.writeNoException()
                     p.writeTypedObject(response.metadata, 0)
@@ -218,10 +233,14 @@ class SecurityLevelInterceptor(
                     // the real key is never stored in keystore2, so getKeyEntry returns the identical
                     // fake cert → Patch-mode / Binder-chain probes see no leaf mismatch.
                     //
-                    // SIGN+challenge keys (attestationChallenge != null, purpose != 7) go through Skip
-                    // so the real TEE key is created and signing operations (createOperation) succeed.
-                    // Their cert chain is hacked and cached in onPostTransact; grant() is intercepted
-                    // in Keystore2Interceptor to block grant-based access and prevent SELF_CHAIN_SPLIT.
+                    // SIGN+challenge keys (attestationChallenge != null, purpose != 7) go through
+                    // Continue so the real TEE key is created (signing operations succeed natively)
+                    // AND onPostTransact fires to leaf-hack + cache the returned chain. This is the
+                    // critical fix: returning Skip would bypass post-transact entirely (see the native
+                    // binder_interceptor.cpp — Skip forwards to keystore2 with NO post callback), so the
+                    // app received the REAL TEE leaf from generateKey but the HACKED leaf from
+                    // getKeyEntry, which Duck Detector's Patch-mode / Binder-chain probes flag as a
+                    // leaf mismatch. Continue makes generateKey == getKeyEntry == Java KeyStore.
                     val isAttestationKey = kgp.purpose.contains(7)
                             || attestationKeyDescriptor != null
                     aliasStates[Key(callingUid, keyDescriptor.alias)] = AliasState(
@@ -245,18 +264,26 @@ class SecurityLevelInterceptor(
                         keyPairs[Key(callingUid, keyDescriptor.alias)] = Pair(pair.first, pair.second)
                         val response = buildResponse(pair.second, kgp, attestationKeyDescriptor ?: keyDescriptor)
                         keys[Key(callingUid, keyDescriptor.alias)] = Info(pair.first, response)
+                        hackedResponseCache[Key(callingUid, keyDescriptor.alias)] = response
                         SecurityLevelInterceptor.skipLeafHacks[Key(callingUid, keyDescriptor.alias)] = true
                         val p = Parcel.obtain()
                         p.writeNoException()
                         p.writeTypedObject(response.metadata, 0)
                         return OverrideReply(0, p)
                     } else {
-                        // Non-attestation key (pure SIGN/ENCRYPT): let real hardware generate it.
-                        // Cert hacking for these keys happens in onPostTransact if the TEE also
-                        // provided an attestation cert (attestationChallenge != null path).
                         skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
-                        Logger.i("Non-attestation key, skipping intercept: uid=$callingUid alias=${keyDescriptor.alias}")
-                        return Skip
+                        return if (kgp.attestationChallenge != null) {
+                            // Real TEE key WITH attestation challenge: Continue so post-transact
+                            // leaf-hacks the returned chain and caches it (consistent everywhere).
+                            Logger.i("SIGN+challenge key, Continue for post-transact hack+cache: uid=$callingUid alias=${keyDescriptor.alias}")
+                            Continue
+                        } else {
+                            // Pure key with NO attestation challenge: there is no attestation cert
+                            // to hack, so generateKey and getKeyEntry both return the real cert.
+                            // Skip (no post-transact needed); stays consistent by construction.
+                            Logger.i("Non-attestation key (no challenge), passthrough: uid=$callingUid alias=${keyDescriptor.alias}")
+                            Skip
+                        }
                     }
                 }
             }.onFailure {
@@ -269,15 +296,11 @@ class SecurityLevelInterceptor(
     /**
      * Post-transact hook for generateKey.
      *
-     * After the onPreTransact change (v2.1.12-shield1), ALL attestation generateKey calls for
-     * target apps (needHack/needGenerate) return OverrideReply, so this hook is no longer
-     * reachable for any target-app attestation path.  It is kept as a safety net for edge
-     * cases (e.g., a target app that somehow bypasses onPreTransact) and for non-target apps
-     * where it correctly returns Skip.
-     *
-     * The cert cache (hackedCertCache) is populated here if somehow reached so that any
-     * subsequent Keystore2Interceptor.onPostTransact getKeyEntry call can return the same
-     * cert bytes rather than calling hackCertificateChain again.
+     * Reached for SIGN+challenge keys of target apps (onPreTransact returns Continue for them).
+     * This is where the real TEE key's attestation chain is leaf-hacked with the keybox cert
+     * and the result is cached so getKeyEntry / Java KeyStore / grant reads all return the
+     * IDENTICAL DER bytes (Duck Detector Patch-mode / Binder-chain consistency). The real key
+     * stays in keystore2, so signing/operation paths behave natively.
      */
     override fun onPostTransact(
         target: IBinder,
@@ -335,6 +358,13 @@ class SecurityLevelInterceptor(
                 realMetadata.certificate ?: ByteArray(0),
                 realMetadata.certificateChain
             )
+
+            // Cache a full response too so grant reads (incl. isolated grantees that cannot
+            // reach keystore2) can be mirrored with these exact bytes.
+            val grantResponse = KeyEntryResponse()
+            grantResponse.metadata = realMetadata
+            grantResponse.iSecurityLevel = original
+            hackedResponseCache[Key(callingUid, keyDescriptor.alias)] = grantResponse
 
             Logger.i("onPostTransact: hacked+cached generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
 

@@ -33,21 +33,17 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         getTransactCode(IKeystoreService.Stub::class.java, "grant")
 
     /**
-     * Grant IDs (nspace values in GRANT-domain KeyDescriptors) for keys whose
-     * owner APP-domain path returned a modified keybox/synthetic chain.
+     * Maps a grant id (the nspace of a GRANT-domain KeyDescriptor returned by grant())
+     * back to the OWNER's (uid, alias) whose attestation chain we leaf-hacked.
      *
-     * When such a key is granted to another UID, getKeyEntry(GRANT) would call
-     * hackCertificateChain again and produce a different DER signature/timestamp
-     * than the owner path, causing SELF/ISOLATED_CHAIN_SPLIT.
-     *
-     * By blocking grant-based getKeyEntry for these IDs (KEY_NOT_FOUND), Duck Detector's
-     * Grant self-domain and Grant isolated-domain probes report UNAVAILABLE instead of
-     * CHAIN_SPLIT, matching official TrickyStore behavior.
-     *
-     * Pure native aliases are deliberately not blocked; a richer AliasState decides
-     * this instead of broad generated-alias membership.
+     * Instead of blocking grant reads (which produced a KEY_NOT_FOUND exception that
+     * Duck Detector's timing side-channel probe captured, and still left a CHAIN_SPLIT),
+     * we MIRROR the owner's exact cached cert/response on getKeyEntry(GRANT). The grantee
+     * — including isolated processes that cannot reach keystore2 — receives byte-for-byte
+     * identical bytes, so Grant self-domain / isolated-domain probes see aligned chains.
+     * This matches official TrickyStore, which keeps grants consistent rather than failing.
      */
-    private val blockedGrantIds = ConcurrentHashMap.newKeySet<Long>()
+    private val grantedCertKeys = ConcurrentHashMap<Long, SecurityLevelInterceptor.Key>()
 
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -88,22 +84,6 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
     private fun isIsolatedUid(uid: Int): Boolean = (uid % 100000) >= 90000
 
-    /**
-     * Build a ServiceSpecificException(KEY_NOT_FOUND) reply without using
-     * android.os.ServiceSpecificException directly (available only in API ≥ 35 for
-     * public use; avoid compile-time dependency).  The Parcel format is:
-     *   int  -8   (EX_SERVICE_SPECIFIC)
-     *   String    (message, nullable → null here)
-     *   int   7   (KEY_NOT_FOUND keystore2 error code)
-     */
-    private fun keyNotFoundReply(): OverrideReply {
-        val p = Parcel.obtain()
-        p.writeInt(-8)        // EX_SERVICE_SPECIFIC
-        p.writeString(null)   // message
-        p.writeInt(7)         // ResponseCode::KEY_NOT_FOUND
-        return OverrideReply(0, p)
-    }
-
     override fun onPreTransact(
         target: IBinder,
         code: Int,
@@ -112,26 +92,35 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         callingPid: Int,
         data: Parcel
     ): Result {
-        // getKeyEntry: handle BEFORE the isIsolatedUid gate so that blocked GRANT IDs
-        // are rejected for BOTH non-isolated and isolated callers.
+        // getKeyEntry: handle BEFORE the isIsolatedUid gate so GRANT-domain reads are mirrored
+        // for BOTH non-isolated and isolated callers.
         if (code == getKeyEntryTransaction && KeyBoxUtils.hasKeyboxes()) {
             Logger.d("intercept pre  $target uid=$callingUid pid=$callingPid dataSz=${data.dataSize()}")
             try {
                 data.enforceInterface(IKeystoreService.DESCRIPTOR)
                 val descriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return Skip
 
-                // Block GRANT-domain access for tracked grant IDs.
-                // These are grants issued for cert-hacked SIGN+challenge keys; letting them
-                // through would cause hackCertificateChain to run again (non-deterministic
-                // timestamp) and produce a different DER → SELF/ISOLATED_CHAIN_SPLIT.
-                if (descriptor.domain == 2 /* GRANT */ && blockedGrantIds.contains(descriptor.nspace)) {
-                    Logger.i("Blocked GRANT nspace=${descriptor.nspace} uid=$callingUid (isolated=${isIsolatedUid(callingUid)})")
-                    return keyNotFoundReply()
+                // GRANT-domain read: mirror the owner's exact hacked response so the grantee
+                // (even an isolated process that cannot reach keystore2) gets byte-for-byte
+                // identical bytes → no CHAIN_SPLIT, no injected exception (timing probe clean).
+                if (descriptor.domain == 2 /* GRANT */) {
+                    val ownerKey = grantedCertKeys[descriptor.nspace]
+                    if (ownerKey != null) {
+                        val cachedResp = SecurityLevelInterceptor.hackedResponseCache[ownerKey]
+                        if (cachedResp != null) {
+                            Logger.i("Mirroring GRANT nspace=${descriptor.nspace} -> owner=$ownerKey uid=$callingUid (isolated=${isIsolatedUid(callingUid)})")
+                            return createTypedObjectReply(cachedResp)
+                        }
+                        // No full response cached: let it through and fix the cert in post.
+                        Logger.i("GRANT nspace=${descriptor.nspace} owner=$ownerKey but no cached response; Continue for post mirror")
+                        return Continue
+                    }
+                    // Unknown grant id: not one of ours, behave normally.
                 }
 
-                // Standard isolated-UID gate: beyond the GRANT check above, isolated processes
-                // must not hit the alias cache (cache is keyed by uid+alias; isolated UIDs are
-                // ephemeral, so a miss would return a null response and crash the caller).
+                // Standard isolated-UID gate: isolated processes must not hit the alias cache
+                // (cache is keyed by uid+alias; isolated UIDs are ephemeral, so a miss would
+                // return a null response and crash the caller).
                 if (isIsolatedUid(callingUid)) return Skip
 
                 if (PkgConfig.needGenerate(callingUid)) {
@@ -201,21 +190,23 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
             return Skip
         } else if (code == grantTransaction) {
-            // Record grants only for aliases whose owner path was actually modified.
-            // Broad generatedAliases tracking broke STRONG because it treated native
-            // real-TEE keys as if they were keybox-hacked.
+            // Record the grant id → owner mapping only for aliases we actually leaf-hacked
+            // (cert/response cached). Pure native keys are not tracked, so their grants pass
+            // through untouched and stay consistent by construction.
             if (PkgConfig.needHack(callingUid) || PkgConfig.needGenerate(callingUid)) {
                 try {
                     data.enforceInterface("android.system.keystore2.IKeystoreService")
                     val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
                     val alias = keyDescriptor?.alias
                     if (alias != null) {
-                        val state = SecurityLevelInterceptor.getAliasState(callingUid, alias)
-                        if (state?.ownerPathModified == true) {
+                        val ownerKey = SecurityLevelInterceptor.Key(callingUid, alias)
+                        val hacked = SecurityLevelInterceptor.hackedCertCache.containsKey(ownerKey) ||
+                                SecurityLevelInterceptor.hackedResponseCache.containsKey(ownerKey)
+                        if (hacked) {
                             val grantDescriptor = reply.readTypedObject(KeyDescriptor.CREATOR)
                             if (grantDescriptor?.domain == 2) {
-                                blockedGrantIds.add(grantDescriptor.nspace)
-                                Logger.i("Tracked GRANT nspace=${grantDescriptor.nspace} alias=$alias uid=$callingUid")
+                                grantedCertKeys[grantDescriptor.nspace] = ownerKey
+                                Logger.i("Tracked GRANT nspace=${grantDescriptor.nspace} -> owner=$ownerKey uid=$callingUid")
                             }
                         }
                     }
@@ -225,69 +216,68 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
             }
             return Skip
         } else if (code == getKeyEntryTransaction) {
-            // Spoof certs for:
-            //   • target apps (needHack/needGenerate) — keybox cert needed for STRONG integrity
-            //   • isolated processes (uid % 100000 >= 90000) — GMS attestation worker runs in an
-            //     isolated process whose UID is NOT in PkgConfig; it still needs the keybox cert
-            //     from getKeyEntry so Play Integrity returns STRONG, not BASIC.
+            // Uniform keybox substitution — NO app is on a deny list. Every app (incl. Duck
+            // Detector and Revolut) must receive the keybox chain so bootloader/TEE checks pass.
             //
-            // For target apps in AUTO mode (e.g. Duck Detector) the primary path is the cert
-            // cache: SecurityLevelInterceptor.onPostTransact hacked generateKey and stored the
-            // cert; we return that SAME cert here so Duck Detector's Patch-mode / Binder-chain
-            // probes see generateKey == getKeyEntry (hackCertificateChain is non-deterministic —
-            // a fresh call produces different DER bytes even for the same key, causing the mismatch).
-            if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid) && !isIsolatedUid(callingUid)) return Skip
+            // Consistency is guaranteed by the cert cache: generateKey leaf-hacked the chain in
+            // SecurityLevelInterceptor.onPostTransact (it now returns Continue, so post fires),
+            // and we return that SAME cached cert here → generateKey == getKeyEntry == Java
+            // KeyStore. hackCertificateChain is non-deterministic, so calling it twice would
+            // produce different DER; the cache is what keeps the bytes identical.
             try {
                 data.enforceInterface("android.system.keystore2.IKeystoreService")
                 val reqDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
-                val alias = reqDescriptor?.alias
+                val isGrant = reqDescriptor?.domain == 2 /* GRANT */
+                // Resolve the cache key: GRANT reads map back to the owner; otherwise uid+alias.
+                val cacheKey: SecurityLevelInterceptor.Key? = when {
+                    isGrant -> reqDescriptor?.let { grantedCertKeys[it.nspace] }
+                    reqDescriptor?.alias != null ->
+                        SecurityLevelInterceptor.Key(callingUid, reqDescriptor.alias)
+                    else -> null
+                }
+                // Act for target apps, isolated GMS workers, or tracked GRANT reads only.
+                val trackedGrant = isGrant && cacheKey != null
+                if (!trackedGrant && !PkgConfig.needHack(callingUid) &&
+                    !PkgConfig.needGenerate(callingUid) && !isIsolatedUid(callingUid)) {
+                    p.recycle()
+                    return Skip
+                }
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)
                 if (response != null) {
-                    // Cache-hit path: return the cert that was produced by generateKey so both
-                    // calls return byte-for-byte identical DER → Duck Detector sees no leaf mismatch.
-                    val cached = if (alias != null)
-                        SecurityLevelInterceptor.hackedCertCache[SecurityLevelInterceptor.Key(callingUid, alias)]
-                    else null
+                    // Cache-hit: return byte-for-byte identical cert produced earlier.
+                    val cached = cacheKey?.let { SecurityLevelInterceptor.hackedCertCache[it] }
                     if (cached != null) {
                         response.metadata?.let { meta ->
                             meta.certificate = cached.first
                             meta.certificateChain = cached.second
                         }
-                        Logger.i("getKeyEntry: cert cache hit uid=$callingUid alias=$alias")
+                        Logger.i("getKeyEntry: cert cache hit uid=$callingUid key=$cacheKey grant=$isGrant")
                         return createTypedObjectReply(response)
                     }
-                    val state = SecurityLevelInterceptor.getAliasState(callingUid, alias)
-                    if (state?.detectorLike == true &&
-                        state.returnedChainKind == SecurityLevelInterceptor.Companion.ChainKind.REAL_TEE &&
-                        state.cachedLeaf == null &&
-                        !state.integrityCritical) {
-                        Logger.i("getKeyEntry: detector native alias, no cache → passthrough uid=$callingUid alias=$alias")
-                        p.recycle()
-                        return Skip
-                    }
-                    // Integrity-critical and normal target apps must receive a keybox chain.
-                    // This restores STRONG on cache-miss paths that v2.1.15 broke by returning
-                    // the real TEE cert to GMS.
                     val chain = CertificateUtils.run { response.getCertificateChain() }
                     if (chain != null) {
                         val newChain = CertificateHack.hackCertificateChain(chain)
                         if (newChain === chain) {
-                            Logger.i("getKeyEntry: no attestation extension or hack failed, passthrough uid=$callingUid alias=$alias")
+                            // No attestation extension (e.g. pure signing cert) — leave it as-is
+                            // so we don't re-wrap a non-attestation entry.
+                            Logger.i("getKeyEntry: no attestation extension, passthrough uid=$callingUid key=$cacheKey")
                             p.recycle()
                             return Skip
                         }
                         response.putCertificateChain(newChain).getOrThrow()
-                        if (alias != null) {
+                        // Cache under the resolved owner key so all later reads stay identical.
+                        if (cacheKey != null) {
                             response.metadata?.let { meta ->
                                 SecurityLevelInterceptor.cacheHackedCert(
-                                    callingUid,
-                                    alias,
+                                    cacheKey.uid,
+                                    cacheKey.alias,
                                     meta.certificate ?: ByteArray(0),
                                     meta.certificateChain
                                 )
+                                SecurityLevelInterceptor.hackedResponseCache[cacheKey] = response
                             }
                         }
-                        Logger.i("Hacked certificate for uid=$callingUid")
+                        Logger.i("Hacked certificate for uid=$callingUid grant=$isGrant key=$cacheKey")
                         return createTypedObjectReply(response)
                     } else {
                         p.recycle()
