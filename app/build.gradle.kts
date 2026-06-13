@@ -131,7 +131,7 @@ afterEvaluate {
                 
                 //apkFile.copyTo(moduleFolder.resolve("service.apk"), overwrite = true)
                 
-                val allowedLibs = setOf("libinject.so", "libTrickyStoreOSS.so")
+                val allowedLibs = setOf("libinject.so", "libShieldAttestation.so")
                 soDir.walk()
                     .filter { it.isFile && it.name in allowedLibs }
                     .forEach { soFile ->

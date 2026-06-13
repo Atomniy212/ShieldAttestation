@@ -32,6 +32,8 @@ class SecurityLevelInterceptor(
     companion object {
         private val generateKeyTransaction =
             getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "generateKey")
+        private val importKeyTransaction =
+            getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "importKey")
         private val deleteKeyTransaction =
             getTransactCode(IKeystoreSecurityLevel.Stub::class.java, "deleteKey")
         private val createOperationTransaction =
@@ -70,6 +72,21 @@ class SecurityLevelInterceptor(
         callingPid: Int,
         data: Parcel
     ): Result {
+        // Invalidate cached attestation state when a key is imported over an existing alias.
+        // Without this, the old keybox cert would be served for a re-imported key (marker-replace detection).
+        if (code == importKeyTransaction) {
+            kotlin.runCatching {
+                data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
+                val k = Key(callingUid, keyDescriptor.alias)
+                keys.remove(k)
+                keyPairs.remove(k)
+                skipLeafHacks.remove(k)
+                Logger.i("importKey: cleared attestation cache uid=$callingUid alias=${keyDescriptor.alias}")
+            }.onFailure { Logger.e("importKey cache clear failed", it) }
+            return Skip
+        }
+
         if (code == generateKeyTransaction) {
             Logger.i("intercept key gen uid=$callingUid pid=$callingPid")
             kotlin.runCatching {
@@ -92,7 +109,15 @@ class SecurityLevelInterceptor(
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
                 } else if (PkgConfig.needHack(callingUid)) {
-                    if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null)) {
+                    // Intercept any key generation that carries an attestation challenge:
+                    //   • PURPOSE_ATTEST_KEY (purpose=7) — primary attestation key
+                    //   • explicit attestationKeyDescriptor  — SIGN key attested via separate key
+                    //   • attestationChallenge != null       — SIGN key using old-style direct attestation
+                    //     (e.g. apps like Duck Detector). GMS uses explicit attestationKeyDescriptor on
+                    //     Android 12+, so it is not affected by the third condition.
+                    // All three paths generate a software-backed key via CertificateGen so that
+                    // generateKey and getKeyEntry return *identical* keybox cert chains.
+                    if ((kgp.purpose.contains(7)) || (attestationKeyDescriptor != null) || (kgp.attestationChallenge != null)) {
                         Logger.i("Generating key in generation mode for attestation: uid=$callingUid alias=${keyDescriptor.alias}")
                         val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
                             ?: return@runCatching

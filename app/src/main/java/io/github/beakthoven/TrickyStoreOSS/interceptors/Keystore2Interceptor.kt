@@ -31,7 +31,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
     
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
-    override val injectionCommand = "exec ./inject `pidof keystore2` libTrickyStoreOSS.so entry"
+    override val injectionCommand = "exec ./inject `pidof keystore2` libShieldAttestation.so entry"
 
     private var teeInterceptor: SecurityLevelInterceptor? = null
     private var strongBoxInterceptor: SecurityLevelInterceptor? = null
@@ -66,6 +66,15 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         }
     }
 
+    /**
+     * Isolated processes (uid % 100000 >= 90000) must not hit the alias cache lookup in
+     * onPreTransact — the cache key is indexed by uid+alias and isolated UIDs are ephemeral,
+     * so a cache miss would return a null KeyEntryResponse, crashing the caller.
+     * onPostTransact is NOT guarded so that GMS's isolated attestation process still gets its
+     * getKeyEntry reply hacked with the keybox cert chain → STRONG integrity preserved.
+     */
+    private fun isIsolatedUid(uid: Int): Boolean = (uid % 100000) >= 90000
+
     override fun onPreTransact(
         target: IBinder,
         code: Int,
@@ -74,6 +83,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         callingPid: Int,
         data: Parcel
     ): Result {
+        if (isIsolatedUid(callingUid)) return Skip
         if (code == getKeyEntryTransaction) {
             if (KeyBoxUtils.hasKeyboxes()) {
                 Logger.d("intercept pre  $target uid=$callingUid pid=$callingPid dataSz=${data.dataSize()}")
