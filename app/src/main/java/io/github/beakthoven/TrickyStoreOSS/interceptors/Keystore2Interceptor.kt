@@ -28,6 +28,10 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         getTransactCode(IKeystoreService.Stub::class.java, "getKeyEntry")
     private val deleteKeyTransaction =
         getTransactCode(IKeystoreService.Stub::class.java, "deleteKey")
+    private val grantTransaction =
+        getTransactCode(IKeystoreService.Stub::class.java, "grant")
+    private val updateSubcomponentTransaction =
+        getTransactCode(IKeystoreService.Stub::class.java, "updateSubcomponent")
     
     override val serviceName = "android.system.keystore2.IKeystoreService/default"
     override val processName = "keystore2"
@@ -87,6 +91,61 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
         data: Parcel
     ): Result {
         if (isIsolatedUid(callingUid)) return Skip
+
+        // Block grant() for aliases whose cert chain was hacked and cached.
+        // After hackCertificateChain runs in onPostTransact for generateKey, the alias is in
+        // hackedCertCache.  The real key exists in TEE (signing works), but if the caller grants
+        // this key to another UID, getKeyEntry(GRANT) would call hackCertificateChain a second
+        // time and produce a different DER (non-deterministic timestamps) → SELF_CHAIN_SPLIT.
+        // Returning KEY_NOT_FOUND here makes the grant fail immediately; Duck Detector's
+        // Grant self-domain probe then reports UNAVAILABLE, matching official TrickyStore.
+        if (code == grantTransaction) {
+            if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid)) return Skip
+            return try {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                val alias = keyDescriptor?.alias
+                if (alias != null &&
+                    SecurityLevelInterceptor.hackedCertCache.containsKey(
+                        SecurityLevelInterceptor.Key(callingUid, alias)
+                    )
+                ) {
+                    Logger.i("grant blocked (cert-hacked alias): uid=$callingUid alias=$alias")
+                    val errParcel = Parcel.obtain()
+                    errParcel.writeException(android.os.ServiceSpecificException(7, "KEY_NOT_FOUND"))
+                    OverrideReply(0, errParcel)
+                } else {
+                    Skip
+                }
+            } catch (e: Exception) {
+                Logger.e("grant intercept failed uid=$callingUid", e)
+                Skip
+            }
+        }
+
+        // Clear cert cache when the key's cert chain is updated via updateSubcomponent
+        // (Android KeyStore's setKeyEntry internally calls this).  Clearing the cache
+        // forces the next getKeyEntry call to run hackCertificateChain on the updated
+        // cert, which preserves the new marker rather than returning the stale hacked cert.
+        if (code == updateSubcomponentTransaction) {
+            try {
+                data.enforceInterface(IKeystoreService.DESCRIPTOR)
+                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                val alias = keyDescriptor?.alias
+                if (alias != null) {
+                    val removed = SecurityLevelInterceptor.hackedCertCache.remove(
+                        SecurityLevelInterceptor.Key(callingUid, alias)
+                    )
+                    if (removed != null) {
+                        Logger.i("updateSubcomponent: cleared cert cache uid=$callingUid alias=$alias")
+                    }
+                }
+            } catch (e: Exception) {
+                Logger.e("updateSubcomponent intercept failed uid=$callingUid", e)
+            }
+            return Skip
+        }
+
         if (code == getKeyEntryTransaction) {
             if (KeyBoxUtils.hasKeyboxes()) {
                 Logger.d("intercept pre  $target uid=$callingUid pid=$callingPid dataSz=${data.dataSize()}")

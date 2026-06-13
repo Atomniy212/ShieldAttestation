@@ -125,18 +125,18 @@ class SecurityLevelInterceptor(
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
                 } else if (PkgConfig.needHack(callingUid)) {
-                    // Intercept ANY key generated with attestation (PURPOSE_ATTEST_KEY, explicit
-                    // attestation-key descriptor, or an attestation challenge).  Using OverrideReply
-                    // here prevents the real key from ever being stored in keystore2, which has two
-                    // critical benefits:
-                    //   1. getKeyEntry (via onPreTransact cache) returns the IDENTICAL cert as
-                    //      generateKey → Patch-mode / Binder-chain probes see no leaf mismatch.
-                    //   2. grant() for the alias fails in real keystore2 (key not found) →
-                    //      getKeyEntry(GRANT) returns KEY_NOT_FOUND → Duck Detector's Grant
-                    //      self-domain probe reports UNAVAILABLE instead of SELF_CHAIN_SPLIT.
+                    // Intercept keys that need a keybox attestation certificate.
+                    //
+                    // PURPOSE_ATTEST_KEY (7) and explicit attestationKeyDescriptor use OverrideReply:
+                    // the real key is never stored in keystore2, so getKeyEntry returns the identical
+                    // fake cert → Patch-mode / Binder-chain probes see no leaf mismatch.
+                    //
+                    // SIGN+challenge keys (attestationChallenge != null, purpose != 7) go through Skip
+                    // so the real TEE key is created and signing operations (createOperation) succeed.
+                    // Their cert chain is hacked and cached in onPostTransact; grant() is intercepted
+                    // in Keystore2Interceptor to block grant-based access and prevent SELF_CHAIN_SPLIT.
                     val isAttestationKey = kgp.purpose.contains(7)
                             || attestationKeyDescriptor != null
-                            || kgp.attestationChallenge != null
                     if (isAttestationKey) {
                         Logger.i("Attestation key intercept (OverrideReply): uid=$callingUid alias=${keyDescriptor.alias}")
                         val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
