@@ -316,20 +316,19 @@ class SecurityLevelInterceptor(
                     generatedAliases.add(Key(callingUid, keyDescriptor.alias))
                     val policy = PkgConfig.policyForUid(callingUid)
 
-                    // Intercept keys that need a keybox attestation certificate.
+                    // Official-TrickyStore model: NEVER synthesize a fake key. Always let the
+                    // REAL key be created in keystore2 via Continue (including PURPOSE_ATTEST_KEY
+                    // and keys built with an app-supplied attestation key), then leaf-hack the
+                    // returned chain in onPostTransact.
                     //
-                    // PURPOSE_ATTEST_KEY (7) and explicit attestationKeyDescriptor use OverrideReply:
-                    // the real key is never stored in keystore2, so getKeyEntry returns the identical
-                    // fake cert → Patch-mode / Binder-chain probes see no leaf mismatch.
-                    //
-                    // SIGN+challenge keys (attestationChallenge != null, purpose != 7) go through
-                    // Continue so the real TEE key is created (signing operations succeed natively)
-                    // AND onPostTransact fires to leaf-hack + cache the returned chain. This is the
-                    // critical fix: returning Skip would bypass post-transact entirely (see the native
-                    // binder_interceptor.cpp — Skip forwards to keystore2 with NO post callback), so the
-                    // app received the REAL TEE leaf from generateKey but the HACKED leaf from
-                    // getKeyEntry, which Duck Detector's Patch-mode / Binder-chain probes flag as a
-                    // leaf mismatch. Continue makes generateKey == getKeyEntry == Java KeyStore.
+                    // Why this matters: synthesizing the key with OverrideReply means the real
+                    // key never lands in keystore2, so any later OPERATION on it (sign / attest
+                    // another key) fails with "key not found". That is exactly what broke the
+                    // timing side-channel probe (it threw during measurement → no ms shown) and,
+                    // critically, what breaks apps like Revolut that generate an attestation key
+                    // and then perform crypto with it. Keeping the real key makes operations run
+                    // natively, just like official TrickyStore. getKeyEntry stays consistent via
+                    // the leaf hash cache (generateKey == getKeyEntry == Java KeyStore).
                     val isAttestationKey = kgp.purpose.contains(7)
                             || attestationKeyDescriptor != null
                     aliasStates[Key(callingUid, keyDescriptor.alias)] = AliasState(
@@ -339,40 +338,24 @@ class SecurityLevelInterceptor(
                         purposes = kgp.purpose.toSet(),
                         hasChallenge = kgp.attestationChallenge != null,
                         usesAttestationKey = isAttestationKey,
-                        returnedChainKind = if (isAttestationKey) ChainKind.SYNTHETIC else ChainKind.REAL_TEE,
-                        nativeKeyExists = !isAttestationKey
+                        returnedChainKind = ChainKind.REAL_TEE,
+                        nativeKeyExists = true
                     )
+                    // Oversized attestation challenge → let native keymint reject it
+                    // (Duck Detector OversizedChallenge probe expects the rejection).
                     if (isAttestationKey && (kgp.attestationChallenge?.size ?: 0) > 128) {
                         Logger.i("Oversized attestation challenge, passthrough to native rejection: uid=$callingUid alias=${keyDescriptor.alias}")
                         return Skip
                     }
-                    if (isAttestationKey) {
-                        Logger.i("Attestation key intercept (OverrideReply): uid=$callingUid alias=${keyDescriptor.alias}")
-                        val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
-                            ?: return@runCatching
-                        keyPairs[Key(callingUid, keyDescriptor.alias)] = Pair(pair.first, pair.second)
-                        val response = buildResponse(pair.second, kgp, attestationKeyDescriptor ?: keyDescriptor)
-                        keys[Key(callingUid, keyDescriptor.alias)] = Info(pair.first, response)
-                        hackedResponseCache[Key(callingUid, keyDescriptor.alias)] = response
-                        SecurityLevelInterceptor.skipLeafHacks[Key(callingUid, keyDescriptor.alias)] = true
-                        val p = Parcel.obtain()
-                        p.writeNoException()
-                        p.writeTypedObject(response.metadata, 0)
-                        return OverrideReply(0, p)
+                    skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
+                    return if (kgp.attestationChallenge != null) {
+                        // Real key created in TEE; post-transact leaf-hacks + caches the chain.
+                        Logger.i("Attested key, Continue for post-transact hack+cache: uid=$callingUid alias=${keyDescriptor.alias} attestKey=$isAttestationKey")
+                        Continue
                     } else {
-                        skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
-                        return if (kgp.attestationChallenge != null) {
-                            // Real TEE key WITH attestation challenge: Continue so post-transact
-                            // leaf-hacks the returned chain and caches it (consistent everywhere).
-                            Logger.i("SIGN+challenge key, Continue for post-transact hack+cache: uid=$callingUid alias=${keyDescriptor.alias}")
-                            Continue
-                        } else {
-                            // Pure key with NO attestation challenge: there is no attestation cert
-                            // to hack, so generateKey and getKeyEntry both return the real cert.
-                            // Skip (no post-transact needed); stays consistent by construction.
-                            Logger.i("Non-attestation key (no challenge), passthrough: uid=$callingUid alias=${keyDescriptor.alias}")
-                            Skip
-                        }
+                        // No attestation challenge → no attestation cert to hack; passthrough.
+                        Logger.i("Non-attestation key (no challenge), passthrough: uid=$callingUid alias=${keyDescriptor.alias}")
+                        Skip
                     }
                 }
             }.onFailure {
@@ -416,9 +399,11 @@ class SecurityLevelInterceptor(
             val params = data.createTypedArray(KeyParameter.CREATOR) ?: return@runCatching Skip
             val kgp = CertificateGen.KeyGenParameters(params)
 
-            // Only handle plain signing keys with attestation challenge; all other cases
-            // are already intercepted in onPreTransact and never reach onPostTransact.
-            if (kgp.purpose.contains(7) || attestationKeyDescriptor != null) return@runCatching Skip
+            // Leaf-hack EVERY attested key — including PURPOSE_ATTEST_KEY and keys built with an
+            // app-supplied attestation key. hackCertificateChain copies the real attestation
+            // extension (challenge, security level, boot state) onto a keybox-signed leaf and
+            // replaces the chain with the keybox CA chain, so the result is consistent regardless
+            // of how the key was attested. Only keys with NO challenge have no cert to hack.
             if (kgp.attestationChallenge == null) return@runCatching Skip
 
             // Parse the real TEE reply.
