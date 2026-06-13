@@ -68,7 +68,7 @@ object KeystoreInterceptor : BaseKeystoreInterceptor() {
     ): Result {
         if (KeyBoxUtils.hasKeyboxes()) {
             if (code == getTransaction) {
-                if (PkgConfig.needHack(callingUid)) {
+                if (PkgConfig.needLeafHack(callingUid)) {
                     return Continue
                 } else if (PkgConfig.needGenerate(callingUid)) {
                     return Skip

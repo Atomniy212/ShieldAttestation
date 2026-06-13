@@ -32,6 +32,17 @@ object PkgConfig {
         "com.eltavine.duck_detector",
         "io.github.vvb2060.keyattestation"
     )
+    /**
+     * Apps whose onCreate anti-tamper (e.g. DexProtector MessageGuard) validates the cert
+     * returned straight from generateKey. For these we passthrough generateKey (real TEE leaf)
+     * and only leaf-hack getKeyEntry — hacking the generateKey reply crashes them (Revolut).
+     * Play Integrity / GMS are NOT in this set and still need generateKey leaf-hack for STRONG.
+     */
+    private val generateKeyPassthroughPackages = setOf(
+        "com.revolut.revolutx",
+        "com.revolut.android",
+        "com.revolut.business",
+    )
 
     enum class Mode {
         AUTO, LEAF_HACK, GENERATE
@@ -174,6 +185,20 @@ object PkgConfig {
         val ps = packagesForUid(callingUid) ?: return false
         ps.any { it in integrityCriticalPackages }
     }.onFailure { Logger.e("failed to resolve integrity-critical packages", it) }.getOrNull() ?: false
+
+    /** True when generateKey must return the native TEE cert (anti-tamper apps like Revolut). */
+    fun shouldPassthroughGenerateKey(callingUid: Int): Boolean = kotlin.runCatching {
+        val ps = packagesForUid(callingUid) ?: return false
+        ps.any { it in generateKeyPassthroughPackages }
+    }.onFailure { Logger.e("failed to resolve generateKey passthrough packages", it) }.getOrNull() ?: false
+
+    /** getKeyEntry leaf-hack: target apps plus Play Integrity / GMS even if not in target.txt. */
+    fun needLeafHack(callingUid: Int): Boolean =
+        needHack(callingUid) || isIntegrityCritical(callingUid)
+
+    /** generateKey leaf-hack: same scope as [needLeafHack], minus anti-tamper passthrough apps. */
+    fun needGenerateKeyLeafHack(callingUid: Int): Boolean =
+        needLeafHack(callingUid) && !shouldPassthroughGenerateKey(callingUid)
 
     fun isDetectorLike(callingUid: Int): Boolean = kotlin.runCatching {
         val ps = packagesForUid(callingUid) ?: return false

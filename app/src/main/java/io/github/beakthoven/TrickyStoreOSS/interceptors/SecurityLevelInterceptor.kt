@@ -312,13 +312,38 @@ class SecurityLevelInterceptor(
                     p.writeNoException()
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
+                } else if (PkgConfig.needGenerateKeyLeafHack(callingUid)) {
+                    // Leaf-hack generateKey in post-transact (required for STRONG). Revolut and
+                    // similar anti-tamper apps are excluded via needGenerateKeyLeafHack.
+                    generatedAliases.add(Key(callingUid, keyDescriptor.alias))
+                    val policy = PkgConfig.policyForUid(callingUid)
+                    val isAttestationKey = kgp.purpose.contains(7)
+                            || attestationKeyDescriptor != null
+                    aliasStates[Key(callingUid, keyDescriptor.alias)] = AliasState(
+                        uid = callingUid,
+                        alias = keyDescriptor.alias,
+                        policy = policy,
+                        purposes = kgp.purpose.toSet(),
+                        hasChallenge = kgp.attestationChallenge != null,
+                        usesAttestationKey = isAttestationKey,
+                        returnedChainKind = ChainKind.REAL_TEE,
+                        nativeKeyExists = true
+                    )
+                    if (isAttestationKey && (kgp.attestationChallenge?.size ?: 0) > 128) {
+                        Logger.i("Oversized attestation challenge, passthrough to native rejection: uid=$callingUid alias=${keyDescriptor.alias}")
+                        return Skip
+                    }
+                    skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
+                    return if (kgp.attestationChallenge != null) {
+                        Logger.i("Attested key, Continue for post-transact hack+cache: uid=$callingUid alias=${keyDescriptor.alias} attestKey=$isAttestationKey")
+                        Continue
+                    } else {
+                        Logger.i("Non-attestation key (no challenge), passthrough: uid=$callingUid alias=${keyDescriptor.alias}")
+                        Skip
+                    }
+                } else if (PkgConfig.needLeafHack(callingUid) && PkgConfig.shouldPassthroughGenerateKey(callingUid)) {
+                    Logger.i("generateKey passthrough (anti-tamper app), getKeyEntry-only hack: uid=$callingUid")
                 }
-                // needHack apps: do NOT intercept generateKey at all (official TrickyStore
-                // model). The real key is created in keystore2 untouched and generateKey returns
-                // the genuine TEE certificate. Hacking the generateKey reply made the app receive
-                // a keybox leaf straight from key creation, which app anti-tamper layers
-                // (e.g. Revolut/DexProtector MessageGuard) validate during onCreate and reject,
-                // crashing the app. Only getKeyEntry is leaf-hacked (Keystore2Interceptor).
             }.onFailure {
                 Logger.e("parse key gen request", it)
             }
@@ -345,12 +370,66 @@ class SecurityLevelInterceptor(
         reply: Parcel?,
         resultCode: Int
     ): Result {
-        // Official-TrickyStore model: generateKey is NEVER hacked. Replacing the generateKey
-        // reply's leaf with the keybox cert made apps receive a spoofed certificate straight
-        // from key creation; app anti-tamper layers (Revolut/DexProtector MessageGuard) verify
-        // the freshly generated key during onCreate and abort when it looks substituted. We only
-        // leaf-hack getKeyEntry reads, so this post-hook is intentionally a no-op.
-        return Skip
+        if (code != generateKeyTransaction || reply == null) return Skip
+        if (!PkgConfig.needGenerateKeyLeafHack(callingUid) && !PkgConfig.needGenerate(callingUid)) return Skip
+
+        return kotlin.runCatching {
+            data.setDataPosition(0)
+            data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+            val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+                ?: return@runCatching Skip
+            val attestationKeyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)
+            val params = data.createTypedArray(KeyParameter.CREATOR) ?: return@runCatching Skip
+            val kgp = CertificateGen.KeyGenParameters(params)
+
+            if (kgp.attestationChallenge == null) return@runCatching Skip
+
+            reply.setDataPosition(0)
+            if (kotlin.runCatching { reply.readException() }.isFailure) return@runCatching Skip
+            val realMetadata = reply.readTypedObject(KeyMetadata.CREATOR)
+                ?: return@runCatching Skip
+
+            val realLeafHash = leafHashKey(realMetadata.certificate)
+
+            val leafCert = CertificateUtils.run { realMetadata.certificate?.toCertificate() }
+                ?: return@runCatching Skip
+            val additionalCerts = CertificateUtils.run { realMetadata.certificateChain.toCertificates() }
+            val chain = (listOf(leafCert) + additionalCerts).toTypedArray<Certificate>()
+
+            val hackedChain = CertificateHack.hackCertificateChain(chain)
+            realMetadata.putCertificateChain(hackedChain).getOrThrow()
+
+            if (realLeafHash != null) {
+                hackedByRealLeaf[realLeafHash] = Pair(
+                    realMetadata.certificate ?: ByteArray(0),
+                    realMetadata.certificateChain
+                )
+            }
+
+            cacheHackedCert(
+                callingUid,
+                keyDescriptor.alias,
+                realMetadata.certificate ?: ByteArray(0),
+                realMetadata.certificateChain
+            )
+
+            val grantResponse = KeyEntryResponse()
+            grantResponse.metadata = realMetadata
+            grantResponse.iSecurityLevel = original
+            hackedResponseCache[Key(callingUid, keyDescriptor.alias)] = grantResponse
+
+            rememberKeyId(realMetadata.key, Key(callingUid, keyDescriptor.alias))
+
+            Logger.i("onPostTransact: hacked+cached generateKey cert for uid=$callingUid alias=${keyDescriptor.alias}")
+
+            val p = Parcel.obtain()
+            p.writeNoException()
+            p.writeTypedObject(realMetadata, 0)
+            OverrideReply(0, p)
+        }.getOrElse { t ->
+            Logger.e("onPostTransact generateKey hack failed uid=$callingUid", t)
+            Skip
+        }
     }
 
     private fun buildResponse(

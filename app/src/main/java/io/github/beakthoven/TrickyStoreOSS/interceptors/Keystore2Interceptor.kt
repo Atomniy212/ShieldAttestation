@@ -137,7 +137,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 // KEY_ID-domain read (Duck Detector's follow-up descriptor) carries no alias.
                 // Continue so onPostTransact resolves the owner via keyIdToOwner and serves the
                 // SAME cached cert as the alias/generate path (otherwise a fresh hack → split).
-                if (descriptor.domain == DOMAIN_KEY_ID && PkgConfig.needHack(callingUid)) {
+                if (descriptor.domain == DOMAIN_KEY_ID && PkgConfig.needLeafHack(callingUid)) {
                     Logger.i("KEY_ID read uid=$callingUid nspace=${descriptor.nspace}; Continue for post resolve")
                     return Continue
                 }
@@ -153,7 +153,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                         nullParcel.writeTypedObject(null as KeyEntryResponse?, 0)
                         return OverrideReply(0, nullParcel)
                     }
-                } else if (PkgConfig.needHack(callingUid)) {
+                } else if (PkgConfig.needLeafHack(callingUid)) {
                     if (SecurityLevelInterceptor.shouldSkipLeafHack(callingUid, descriptor.alias)) {
                         Logger.i("skip leaf hack for uid=$callingUid alias=${descriptor.alias}")
                         val response = SecurityLevelInterceptor.getKeyResponse(callingUid, descriptor.alias)
@@ -265,7 +265,7 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
                 }
                 // Act for target apps, isolated GMS workers, or tracked GRANT reads only.
                 val trackedGrant = isGrant && cacheKey != null
-                if (!trackedGrant && !PkgConfig.needHack(callingUid) &&
+                if (!trackedGrant && !PkgConfig.needLeafHack(callingUid) &&
                     !PkgConfig.needGenerate(callingUid) && !isIsolatedUid(callingUid)) {
                     p.recycle()
                     return Skip
