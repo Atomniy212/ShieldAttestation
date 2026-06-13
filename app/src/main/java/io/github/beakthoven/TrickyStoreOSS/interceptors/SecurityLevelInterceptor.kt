@@ -64,22 +64,46 @@ class SecurityLevelInterceptor(
         val hackedCertCache = ConcurrentHashMap<Key, Pair<ByteArray, ByteArray?>>()
 
         /**
-         * Set of all aliases for which a needHack app called generateKey (regardless of
-         * whether attestation was involved or the cert cache was populated).
-         *
-         * Used by Keystore2Interceptor.onPostTransact to decide the getKeyEntry policy:
-         *  - If alias is in hackedCertCache → return the EXACT same cert that generateKey returned.
-         *  - If alias is in generatedAliases but NOT in hackedCertCache → return Skip so the
-         *    caller gets the REAL cert from keystore2, which is byte-for-byte identical to what
-         *    generateKey returned (both paths hit the real TEE → same cert → Patch mode passes).
-         *  - If alias is in neither set → fresh hackCertificateChain (isolated GMS path, etc.).
-         *
-         * Also used for grant tracking: any alias in this set that is subsequently granted
-         * gets its nspace added to Keystore2Interceptor.blockedGrantIds to prevent the
-         * grant-based getKeyEntry from calling hackCertificateChain with a different timestamp.
+         * Legacy membership set kept only as a weak signal for diagnostics/backward
+         * compatibility. It must never decide getKeyEntry passthrough by itself:
+         * Play Integrity/GMS needs the keybox chain on every cache-miss path.
          */
         @Keep
         val generatedAliases = ConcurrentHashMap.newKeySet<Key>()
+
+        enum class ChainKind {
+            NONE,
+            REAL_TEE,
+            KEYBOX_HACKED,
+            SYNTHETIC
+        }
+
+        data class AliasState(
+            val uid: Int,
+            val alias: String,
+            val policy: PkgConfig.AttestationPolicy,
+            val purposes: Set<Int>,
+            val hasChallenge: Boolean,
+            val usesAttestationKey: Boolean,
+            @Volatile var returnedChainKind: ChainKind = ChainKind.NONE,
+            @Volatile var cachedLeaf: ByteArray? = null,
+            @Volatile var cachedChain: ByteArray? = null,
+            @Volatile var nativeKeyExists: Boolean = false
+        ) {
+            val integrityCritical: Boolean
+                get() = policy == PkgConfig.AttestationPolicy.INTEGRITY_CRITICAL
+
+            val detectorLike: Boolean
+                get() = policy == PkgConfig.AttestationPolicy.DETECTOR
+
+            val ownerPathModified: Boolean
+                get() = returnedChainKind == ChainKind.KEYBOX_HACKED ||
+                        returnedChainKind == ChainKind.SYNTHETIC ||
+                        cachedLeaf != null
+        }
+
+        @Keep
+        val aliasStates = ConcurrentHashMap<Key, AliasState>()
 
         @Keep
         fun getKeyResponse(uid: Int, alias: String): KeyEntryResponse? =
@@ -92,6 +116,32 @@ class SecurityLevelInterceptor(
         @Keep
         fun shouldSkipLeafHack(uid: Int, alias: String): Boolean =
             skipLeafHacks[Key(uid, alias)] ?: false
+
+        @Keep
+        fun getAliasState(uid: Int, alias: String?): AliasState? =
+            alias?.let { aliasStates[Key(uid, it)] }
+
+        @Keep
+        fun clearAliasState(uid: Int, alias: String) {
+            val k = Key(uid, alias)
+            keys.remove(k)
+            keyPairs.remove(k)
+            skipLeafHacks.remove(k)
+            hackedCertCache.remove(k)
+            generatedAliases.remove(k)
+            aliasStates.remove(k)
+        }
+
+        @Keep
+        fun cacheHackedCert(uid: Int, alias: String, leaf: ByteArray, chain: ByteArray?) {
+            val k = Key(uid, alias)
+            hackedCertCache[k] = Pair(leaf, chain)
+            aliasStates[k]?.let { state ->
+                state.cachedLeaf = leaf
+                state.cachedChain = chain
+                state.returnedChainKind = ChainKind.KEYBOX_HACKED
+            }
+        }
     }
 
     data class Key(val uid: Int, val alias: String)
@@ -111,14 +161,19 @@ class SecurityLevelInterceptor(
             kotlin.runCatching {
                 data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
                 val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
-                val k = Key(callingUid, keyDescriptor.alias)
-                keys.remove(k)
-                keyPairs.remove(k)
-                skipLeafHacks.remove(k)
-                hackedCertCache.remove(k)
-                generatedAliases.remove(k)
+                clearAliasState(callingUid, keyDescriptor.alias)
                 Logger.i("importKey: cleared attestation cache uid=$callingUid alias=${keyDescriptor.alias}")
             }.onFailure { Logger.e("importKey cache clear failed", it) }
+            return Skip
+        }
+
+        if (code == deleteKeyTransaction) {
+            kotlin.runCatching {
+                data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
+                val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR) ?: return@runCatching
+                clearAliasState(callingUid, keyDescriptor.alias)
+                Logger.i("deleteKey: cleared attestation cache uid=$callingUid alias=${keyDescriptor.alias}")
+            }.onFailure { Logger.e("deleteKey cache clear failed", it) }
             return Skip
         }
 
@@ -134,6 +189,16 @@ class SecurityLevelInterceptor(
                 val entropy = data.createByteArray()
                 val kgp = CertificateGen.KeyGenParameters(params)
                 if (PkgConfig.needGenerate(callingUid)) {
+                    aliasStates[Key(callingUid, keyDescriptor.alias)] = AliasState(
+                        uid = callingUid,
+                        alias = keyDescriptor.alias,
+                        policy = PkgConfig.policyForUid(callingUid),
+                        purposes = kgp.purpose.toSet(),
+                        hasChallenge = kgp.attestationChallenge != null,
+                        usesAttestationKey = attestationKeyDescriptor != null,
+                        returnedChainKind = ChainKind.SYNTHETIC,
+                        nativeKeyExists = false
+                    )
                     val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
                         ?: return@runCatching
                     keyPairs[Key(callingUid, keyDescriptor.alias)] = Pair(pair.first, pair.second)
@@ -144,12 +209,8 @@ class SecurityLevelInterceptor(
                     p.writeTypedObject(response.metadata, 0)
                     return OverrideReply(0, p)
                 } else if (PkgConfig.needHack(callingUid)) {
-                    // Track ALL generateKey calls for this needHack UID regardless of type.
-                    // Keystore2Interceptor uses this to decide the getKeyEntry cert policy:
-                    // if the alias is known but NOT in hackedCertCache, return the real TEE cert
-                    // unchanged (same cert that generateKey returned) instead of calling
-                    // hackCertificateChain again with a different timestamp → Patch mode passes.
                     generatedAliases.add(Key(callingUid, keyDescriptor.alias))
+                    val policy = PkgConfig.policyForUid(callingUid)
 
                     // Intercept keys that need a keybox attestation certificate.
                     //
@@ -163,6 +224,20 @@ class SecurityLevelInterceptor(
                     // in Keystore2Interceptor to block grant-based access and prevent SELF_CHAIN_SPLIT.
                     val isAttestationKey = kgp.purpose.contains(7)
                             || attestationKeyDescriptor != null
+                    aliasStates[Key(callingUid, keyDescriptor.alias)] = AliasState(
+                        uid = callingUid,
+                        alias = keyDescriptor.alias,
+                        policy = policy,
+                        purposes = kgp.purpose.toSet(),
+                        hasChallenge = kgp.attestationChallenge != null,
+                        usesAttestationKey = isAttestationKey,
+                        returnedChainKind = if (isAttestationKey) ChainKind.SYNTHETIC else ChainKind.REAL_TEE,
+                        nativeKeyExists = !isAttestationKey
+                    )
+                    if (isAttestationKey && (kgp.attestationChallenge?.size ?: 0) > 128) {
+                        Logger.i("Oversized attestation challenge, passthrough to native rejection: uid=$callingUid alias=${keyDescriptor.alias}")
+                        return Skip
+                    }
                     if (isAttestationKey) {
                         Logger.i("Attestation key intercept (OverrideReply): uid=$callingUid alias=${keyDescriptor.alias}")
                         val pair = CertificateGen.generateKeyPair(callingUid, keyDescriptor, attestationKeyDescriptor, kgp, level)
@@ -179,8 +254,6 @@ class SecurityLevelInterceptor(
                         // Non-attestation key (pure SIGN/ENCRYPT): let real hardware generate it.
                         // Cert hacking for these keys happens in onPostTransact if the TEE also
                         // provided an attestation cert (attestationChallenge != null path).
-                        // Alias is already in generatedAliases above so getKeyEntry will not call
-                        // hackCertificateChain fresh (which would produce a mismatching cert).
                         skipLeafHacks.remove(Key(callingUid, keyDescriptor.alias))
                         Logger.i("Non-attestation key, skipping intercept: uid=$callingUid alias=${keyDescriptor.alias}")
                         return Skip
@@ -256,7 +329,9 @@ class SecurityLevelInterceptor(
             // will look this up for getKeyEntry and return the SAME bytes, making
             // generateKey and getKeyEntry byte-for-byte identical so Duck Detector's
             // Patch-mode and Binder-chain probes no longer detect a leaf mismatch.
-            hackedCertCache[Key(callingUid, keyDescriptor.alias)] = Pair(
+            cacheHackedCert(
+                callingUid,
+                keyDescriptor.alias,
                 realMetadata.certificate ?: ByteArray(0),
                 realMetadata.certificateChain
             )

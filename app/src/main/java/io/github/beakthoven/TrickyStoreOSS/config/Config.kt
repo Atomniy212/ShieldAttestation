@@ -20,9 +20,31 @@ object PkgConfig {
     private val hackPackages = mutableSetOf<String>()
     private val generatePackages = mutableSetOf<String>()
     private val packageModes = mutableMapOf<String, Mode>()
+    private val integrityCriticalPackages = setOf(
+        "com.google.android.gms",
+        "com.google.android.gms.unstable",
+        "com.google.android.gms.persistent",
+        "com.android.vending",
+        "com.google.android.gsf"
+    )
+    private val detectorPackages = setOf(
+        "com.eltavine.duckdetector",
+        "com.eltavine.duck_detector",
+        "io.github.vvb2060.keyattestation"
+    )
 
     enum class Mode {
         AUTO, LEAF_HACK, GENERATE
+    }
+
+    enum class AttestationPolicy {
+        NONE,
+        INTEGRITY_CRITICAL,
+        DETECTOR,
+        LEAF_HACK,
+        GENERATE,
+        AUTO_HACK,
+        AUTO_GENERATE
     }
 
     private fun updateTargetPackages(f: File?) = runCatching {
@@ -145,8 +167,41 @@ object PkgConfig {
         return iPm
     }
 
+    private fun packagesForUid(callingUid: Int): Array<String>? =
+        getPm()?.getPackagesForUid(callingUid)
+
+    fun isIntegrityCritical(callingUid: Int): Boolean = kotlin.runCatching {
+        val ps = packagesForUid(callingUid) ?: return false
+        ps.any { it in integrityCriticalPackages }
+    }.onFailure { Logger.e("failed to resolve integrity-critical packages", it) }.getOrNull() ?: false
+
+    fun isDetectorLike(callingUid: Int): Boolean = kotlin.runCatching {
+        val ps = packagesForUid(callingUid) ?: return false
+        ps.any { pkg -> pkg in detectorPackages || pkg.contains("duckdetector", ignoreCase = true) }
+    }.onFailure { Logger.e("failed to resolve detector packages", it) }.getOrNull() ?: false
+
+    fun policyForUid(callingUid: Int): AttestationPolicy = kotlin.runCatching {
+        val ps = packagesForUid(callingUid) ?: return AttestationPolicy.NONE
+        if (teeBroken == null) loadTEEStatus(root)
+        var detector = false
+        for (pkg in ps) {
+            if (pkg in integrityCriticalPackages) return AttestationPolicy.INTEGRITY_CRITICAL
+            if (pkg in detectorPackages || pkg.contains("duckdetector", ignoreCase = true)) detector = true
+            when (packageModes[pkg]) {
+                Mode.GENERATE -> return AttestationPolicy.GENERATE
+                Mode.LEAF_HACK -> return if (detector) AttestationPolicy.DETECTOR else AttestationPolicy.LEAF_HACK
+                Mode.AUTO -> {
+                    if (teeBroken == true) return AttestationPolicy.AUTO_GENERATE
+                    if (teeBroken == false) return if (detector) AttestationPolicy.DETECTOR else AttestationPolicy.AUTO_HACK
+                }
+                else -> {}
+            }
+        }
+        if (detector) AttestationPolicy.DETECTOR else AttestationPolicy.NONE
+    }.onFailure { Logger.e("failed to resolve attestation policy", it) }.getOrNull() ?: AttestationPolicy.NONE
+
     fun needHack(callingUid: Int): Boolean = kotlin.runCatching {
-        val ps = getPm()?.getPackagesForUid(callingUid) ?: return false
+        val ps = packagesForUid(callingUid) ?: return false
         if (teeBroken == null) loadTEEStatus(root)
         for (pkg in ps) {
             when (packageModes[pkg]) {
@@ -161,7 +216,7 @@ object PkgConfig {
     }.onFailure { Logger.e("failed to get packages", it) }.getOrNull() ?: false
 
     fun needGenerate(callingUid: Int): Boolean = kotlin.runCatching {
-        val ps = getPm()?.getPackagesForUid(callingUid) ?: return false
+        val ps = packagesForUid(callingUid) ?: return false
         if (teeBroken == null) loadTEEStatus(root)
         for (pkg in ps) {
             when (packageModes[pkg]) {
