@@ -157,13 +157,18 @@ object Keystore2Interceptor : BaseKeystoreInterceptor() {
 
             return Skip
         } else if (code == getKeyEntryTransaction) {
-            // Only spoof certs for target apps (needHack/needGenerate).
-            // Non-target apps get the real TEE cert from both getKeyEntry (this skip) and
-            // generateKey (SecurityLevelInterceptor also skips non-target) → both paths return
-            // the real cert → no mismatch → Patch-mode / Binder-chain detections resolved.
-            // hackCertificateChain is non-deterministic (fresh timestamp each call), so hacking
-            // both paths independently would still produce differing certs even if both "hacked".
-            if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid)) return Skip
+            // Spoof certs for:
+            //   • target apps (needHack/needGenerate) — keybox cert needed for STRONG integrity
+            //   • isolated processes (uid % 100000 >= 90000) — GMS attestation worker runs in an
+            //     isolated process whose UID is NOT in PkgConfig; it still needs the keybox cert
+            //     from getKeyEntry so Play Integrity returns STRONG, not BASIC.
+            //
+            // Non-target, non-isolated apps (e.g. Duck Detector) get the real TEE cert here.
+            // SecurityLevelInterceptor.onPostTransact also skips them for generateKey, so both
+            // paths return the real cert → consistent → Patch-mode / Binder-chain detections pass.
+            // hackCertificateChain is non-deterministic (fresh timestamp each call); hacking both
+            // paths for the same alias would produce two different certs — still a mismatch.
+            if (!PkgConfig.needHack(callingUid) && !PkgConfig.needGenerate(callingUid) && !isIsolatedUid(callingUid)) return Skip
             try {
                 data.enforceInterface("android.system.keystore2.IKeystoreService")
                 val response = reply.readTypedObject(KeyEntryResponse.CREATOR)
